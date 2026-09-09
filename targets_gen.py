@@ -159,11 +159,20 @@ def const_name_and_value(code_lines, start, getter):
 
 
 def func_name(code_lines, start):
-    """Имя функции из сигнатуры под маркером."""
-    for k in range(start, min(start + 4, len(code_lines))):
-        if any(m in code_lines[k] for m in KIND_BY_MARK):
+    """Имя функции из сигнатуры под маркером.
+
+    Пропускаем строки-продолжения (role:/reveal: комментарии) и атрибуты
+    (#[cfg...]) -- их между маркером и fn может быть много, а имя надо взять из
+    первой РЕАЛЬНОЙ строки кода, не из скобок в тексте reveal.
+    """
+    for k in range(start, min(start + 15, len(code_lines))):
+        line = code_lines[k]
+        s = line.strip()
+        if not s or s.startswith("//") or s.startswith("#") or s.startswith("///"):
             continue
-        m = FUNC_NAME.search(code_lines[k])
+        if any(m in line for m in KIND_BY_MARK):
+            continue
+        m = FUNC_NAME.search(line)
         if m and m.group(1) not in ("if", "for", "while", "switch", "return", "match"):
             return m.group(1), k + 1
     return None, start + 1
