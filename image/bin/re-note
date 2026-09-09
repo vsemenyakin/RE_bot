@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Запись вывода в общий журнал находок (findings.jsonl).
+
+    re-note "0x1234 -- разбор конфига из /etc/foo.conf" --conf 0.8 --addr 0x1234
+    re-note "жёстко зашитый ключ AES" --conf 0.6 --tag crypto --tag hardcoded
+
+Одна находка -- одна строка JSON. Формат общий для всех моделей, поэтому
+результаты разных агентов потом механически сравниваются между собой.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Добавить находку в findings.jsonl")
+    ap.add_argument("text", help="вывод одним предложением")
+    ap.add_argument("--conf", type=float, default=0.5,
+                    help="уверенность 0.0-1.0 (честно: догадка -- это 0.3, не 0.9)")
+    ap.add_argument("--addr", default="", help="адрес или имя функции, если применимо")
+    ap.add_argument("--tag", action="append", default=[], help="метка, можно несколько")
+    ap.add_argument("--evidence", default="", help="чем подтверждается: команда, строка, xref")
+    ap.add_argument("--file", default=os.environ.get("RE_FINDINGS", "/work/findings.jsonl"))
+    args = ap.parse_args()
+
+    if not 0.0 <= args.conf <= 1.0:
+        print("--conf должен быть в диапазоне 0.0-1.0", file=sys.stderr)
+        return 2
+
+    rec = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "agent": os.environ.get("RE_AGENT", "unknown"),
+        "addr": args.addr,
+        "text": args.text,
+        "confidence": args.conf,
+        "tags": args.tag,
+        "evidence": args.evidence,
+    }
+    path = Path(args.file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print("записано в %s" % path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

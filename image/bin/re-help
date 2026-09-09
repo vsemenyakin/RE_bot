@@ -1,0 +1,3 @@
+#!/bin/bash
+# Печатает шпаргалку по среде (то же, что /TOOLS.md).
+exec cat /opt/re/TOOLS.md

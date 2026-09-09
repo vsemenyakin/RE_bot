@@ -1,0 +1,4 @@
+#!/bin/bash
+# Кто вызывает эту функцию и кого зовёт она. Мгновенно.
+set -euo pipefail
+exec python3 /opt/re/lib/re_query.py xrefs "$@"

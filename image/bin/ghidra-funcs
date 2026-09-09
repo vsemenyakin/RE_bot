@@ -1,0 +1,4 @@
+#!/bin/bash
+# Список функций из дампа. Мгновенно.
+set -euo pipefail
+exec python3 /opt/re/lib/re_query.py funcs "$@"

@@ -1,0 +1,75 @@
+#!/bin/bash
+# Быстрая паспортизация ARM-бинаря: что это, под какую архитектуру,
+# какие библиотеки нужны, какие защиты включены.
+# Намеренно без pipefail: конструкции вида `cmd | grep -q` дают ложный сбой,
+# когда grep -q закрывает канал раньше, чем cmd допишет вывод.
+set -u
+BIN="${1:?использование: rpi-info <бинарь>}"
+
+echo "=== file ==="
+file "$BIN"
+
+echo
+echo "=== ELF header ==="
+readelf -h "$BIN" 2>/dev/null | sed -n '2,20p'
+
+echo
+echo "=== зависимости (DT_NEEDED) ==="
+readelf -d "$BIN" 2>/dev/null | grep -E 'NEEDED|RPATH|RUNPATH|SONAME' || echo "  (статическая сборка или не ELF)"
+
+echo
+echo "=== защиты ==="
+# Считаем сами по readelf. Утилите checksec тут доверять нельзя: в PATH может
+# оказаться одноимённый скрипт из pwntools с совершенно другим синтаксисом,
+# и вызов молча не даёт ничего.
+hdr=$(readelf -hlWd "$BIN" 2>/dev/null)
+dynsyms=$(nm -D "$BIN" 2>/dev/null)
+[ -n "$dynsyms" ] || dynsyms=$(readelf --dyn-syms -W "$BIN" 2>/dev/null)
+
+if [ -z "$hdr" ]; then
+    echo "  (не ELF или readelf не смог разобрать файл)"
+else
+    # Сопоставление через case, а не через `| grep -q`: никаких конвейеров,
+    # значит никакого SIGPIPE и никакой зависимости результата от гонки.
+    case "$hdr" in
+        *BIND_NOW*|*" NOW"*) echo "  RELRO     : full" ;;
+        *GNU_RELRO*)         echo "  RELRO     : partial" ;;
+        *)                   echo "  RELRO     : no" ;;
+    esac
+    case "$hdr" in *GNU_STACK*RWE*) echo "  NX        : no" ;; *) echo "  NX        : yes" ;; esac
+    case "$hdr" in *"Type:"*DYN*)   echo "  PIE       : yes" ;; *) echo "  PIE       : no" ;; esac
+    case "$dynsyms" in
+        *__stack_chk_fail*) echo "  Canary    : yes" ;;
+        *)                  echo "  Canary    : no" ;;
+    esac
+    case "$hdr" in *RPATH*|*RUNPATH*) echo "  RPATH     : задан, см. секцию зависимостей" ;; esac
+fi
+
+echo
+echo "=== символы ==="
+if readelf -h "$BIN" 2>/dev/null | grep -q 'Type:'; then
+    n=$(readelf -sW "$BIN" 2>/dev/null | grep -c 'FUNC' || true)
+    echo "  символов FUNC в таблице: ${n:-0}"
+    [ "${n:-0}" -lt 5 ] && echo "  (похоже на stripped -- имён функций не будет, Ghidra даст FUN_xxxx)"
+fi
+
+echo
+echo "=== упаковка ==="
+if command -v upx >/dev/null 2>&1 && upx -t "$BIN" >/dev/null 2>&1; then
+    echo "  UPX: да, распаковать: upx -d -o unpacked \"$BIN\""
+else
+    ent=$(python3 - "$BIN" <<'PY' 2>/dev/null
+import math, sys, collections
+d = open(sys.argv[1], 'rb').read()
+if d:
+    c = collections.Counter(d)
+    e = -sum((v/len(d)) * math.log2(v/len(d)) for v in c.values())
+    print("%.2f" % e)
+PY
+)
+    echo "  энтропия файла: ${ent:-?} (>7.2 -- вероятно упакован/зашифрован)"
+fi
+
+echo
+echo "Дальше: ghidra-analyze \"$BIN\"   (статика)"
+echo "        rpi-run \"$BIN\"          (запуск под qemu, только в изолированном контейнере)"

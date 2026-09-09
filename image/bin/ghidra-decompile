@@ -1,0 +1,4 @@
+#!/bin/bash
+# C-псевдокод одной функции по адресу или имени. Мгновенно.
+set -euo pipefail
+exec python3 /opt/re/lib/re_query.py decompile "$@"

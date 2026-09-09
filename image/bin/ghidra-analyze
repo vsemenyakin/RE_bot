@@ -1,0 +1,5 @@
+#!/bin/bash
+# Один раз анализирует бинарь Ghidra-ой и раскладывает результат в файлы.
+# Долго (минуты). Повторно запускать не нужно -- дальше ghidra-funcs/decompile/xrefs.
+set -euo pipefail
+exec python3 /opt/re/lib/ghidra_dump.py "$@"

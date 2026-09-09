@@ -1,0 +1,55 @@
+#!/bin/bash
+# Запуск ARM-бинаря Raspberry Pi на x86-хосте через qemu-user.
+#
+#   rpi-run ./sample arg1 arg2      обычный запуск
+#   rpi-run --strace ./sample       с трассировкой системных вызовов
+#   rpi-run --gdb 1234 ./sample     остановиться и ждать отладчик на порту 1234
+#   rpi-run --root /path ./sample   свой ARM-корень (например, распакованный образ Pi OS)
+#
+# ВНИМАНИЕ: это ЗАПУСК недоверенного кода. Только в контейнере с --network none.
+set -euo pipefail
+
+STRACE=0
+GDBPORT=""
+ROOT=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --strace) STRACE=1; shift ;;
+        --gdb)    GDBPORT="${2:?--gdb требует порт}"; shift 2 ;;
+        --root)   ROOT="${2:?--root требует путь}"; shift 2 ;;
+        --)       shift; break ;;
+        -*)       echo "неизвестный флаг: $1" >&2; exit 2 ;;
+        *)        break ;;
+    esac
+done
+
+BIN="${1:?использование: rpi-run [--strace] [--gdb PORT] [--root DIR] <бинарь> [аргументы]}"
+shift || true
+
+machine=$(readelf -h "$BIN" 2>/dev/null | awk -F: '/Machine:/ {gsub(/^ +/,"",$2); print $2}')
+case "$machine" in
+    *AArch64*) QEMU=qemu-aarch64-static; DEFROOT=/opt/rpi-root/arm64 ;;
+    *ARM*)     QEMU=qemu-arm-static;     DEFROOT=/opt/rpi-root/armhf ;;
+    *)
+        echo "Не ARM-бинарь (Machine: ${machine:-?})." >&2
+        echo "Если это x86 -- запускайте напрямую, qemu не нужен." >&2
+        exit 2 ;;
+esac
+ROOT="${ROOT:-$DEFROOT}"
+
+if [[ ! -d "$ROOT" ]]; then
+    echo "Нет ARM-корня: $ROOT" >&2
+    exit 2
+fi
+
+args=()
+[[ $STRACE -eq 1 ]] && args+=(-strace)
+[[ -n "$GDBPORT" ]] && args+=(-g "$GDBPORT")
+
+if [[ -n "$GDBPORT" ]]; then
+    echo "[*] $QEMU ждёт отладчик на порту $GDBPORT. Во втором терминале контейнера:" >&2
+    echo "    gdb-multiarch -q \"$BIN\" -ex 'target remote localhost:$GDBPORT'" >&2
+fi
+echo "[*] корень: $ROOT   эмулятор: $QEMU" >&2
+
+exec "$QEMU" -L "$ROOT" "${args[@]}" -- "$BIN" "$@"
