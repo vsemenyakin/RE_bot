@@ -1,0 +1,31 @@
+# Аргументы RE-сессии для run_RE.py. Формат: ключ = значение, # -- комментарий.
+#
+# Здесь задаётся ТОЛЬКО атака (шаг orchestrate). Генерация целей и судья берут
+# пути из блока [judge] ниже. Имя прогона run_RE придумывает сам.
+
+# --- Атака (orchestrate.py) ---
+sample = samples/kerbside
+
+# Зависимости бинаря через пробел: библиотеки, данные, входные файлы.
+deps = samples/libonnxruntime.so samples/vehicle.onnx samples/scene.krw
+
+# Модели через запятую (нотация LiteLLM). Точные id -- openrouter.ai/models.
+models = openrouter/anthropic/claude-opus-4.8,openrouter/x-ai/grok-4.6
+
+# Общий бюджет в $, делится поровну между моделями.
+budget-total = 6
+
+# Метка версии бинаря -- по ней судья сравнивает регрессии между версиями.
+label = kerbside-0.1.0
+
+# Необязательное:
+# parallel = 3
+# max-turns = 80
+# no-pi =            (без значения -- просто наличие ключа включает флаг)
+
+# --- Эталон (targets_gen.py + judge.py) ---
+# Исходники с маркерами @re-target-* и куда класть сгенерированный targets.yaml.
+source = truth
+targets-out = truth/protected.yaml
+# Cargo.toml для имени/версии бинаря; убери строку, если проект не на Rust.
+cargo = truth/Cargo.toml

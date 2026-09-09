@@ -154,6 +154,10 @@ def main():
     manifest["wall_seconds"] = round(time.time() - t0)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # Имя последнего прогона -- чтобы судью можно было запустить вручную без
+    # выискивания каталога. run_RE.py путь и так знает (сам задал --run-dir).
+    (run_dir.parent / "LAST_RUN.txt").write_text(run_dir.name, encoding="utf-8")
+
     # Сводка по прогону.
     total_usd = sum(r.get("usd", 0) for r in results.values() if isinstance(r.get("usd"), (int, float)))
     with_report = sum(1 for r in results.values() if r.get("report"))
