@@ -878,6 +878,21 @@ def main():
             pi.close()
     summary["pi"] = f"{pi.user}@{pi.host}" if pi else None
 
+    # Конфигурация атаки: по ней судья решает, сопоставимы ли два замера.
+    # Сравнивать стойкость версий бинаря можно только при ОДИНАКОВОЙ атаке;
+    # смена промпта/моделей/бюджета -- другая атака, дельта между ними не значит
+    # изменения защищённости. Фиксируем то, что влияет на силу атаки.
+    import hashlib
+    def _sha(s):
+        return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
+    summary["attack"] = {
+        "prompt_sha": _sha(SYSTEM_PROMPT),
+        "task_sha": _sha(args.task),
+        "max_turns": args.max_turns,
+        "max_usd": args.max_usd,
+        "pi_available": pi is not None,
+    }
+
     findings = sum(1 for _ in (work / "findings.jsonl").open(encoding="utf-8"))
     summary["findings"] = findings
     summary["report"] = (work / "report.md").is_file()

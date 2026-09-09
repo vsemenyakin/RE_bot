@@ -224,9 +224,33 @@ def score(targets, verdicts):
     return resilience, rows
 
 
-def find_previous(run_dir, binary_name):
-    """Ищет предыдущий замер того же бинаря для дельты регрессии."""
-    prev = None
+def attack_fingerprint(reports):
+    """Отпечаток силы атаки: набор моделей и их конфигурация.
+
+    Стойкость двух ВЕРСИЙ бинаря сравнима только при ОДИНАКОВОЙ атаке. Разные
+    модели, промпт, бюджет или доступность Pi -- другая атака, и разница в балле
+    отражает силу атаки, а не защищённость. Отпечаток отсекает такие сравнения.
+    """
+    import hashlib
+    parts = []
+    for model, data in sorted(reports.items()):
+        a = data["summary"].get("attack", {})
+        parts.append("|".join(str(x) for x in [
+            model, a.get("prompt_sha", "?"), a.get("task_sha", "?"),
+            a.get("max_turns", "?"), a.get("max_usd", "?"), a.get("pi_available", "?"),
+        ]))
+    blob = "\n".join(parts)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12], sorted(reports)
+
+
+def find_previous(run_dir, binary_name, fingerprint):
+    """Ищет прошлые замеры того же бинаря, разделяя их по сопоставимости.
+
+    Возвращает (comparable, incomparable):
+      comparable   -- замеры С ТЕМ ЖЕ отпечатком атаки (дельту считать можно);
+      incomparable -- замеры с другим отпечатком (разной атакой -- дельту нельзя).
+    """
+    comparable, incomparable = [], []
     for f in sorted(RUNS.glob("*/resilience.json")):
         if f.parent == run_dir:
             continue
@@ -234,9 +258,13 @@ def find_previous(run_dir, binary_name):
             d = json.loads(f.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if d.get("binary") == binary_name:
-            prev = d  # берём самый свежий по порядку сортировки
-    return prev
+        if d.get("binary") != binary_name:
+            continue
+        if d.get("attack_fingerprint") == fingerprint:
+            comparable.append(d)
+        else:
+            incomparable.append(d)
+    return comparable, incomparable
 
 
 def main():
@@ -298,6 +326,7 @@ def main():
         sys.exit(f"не разобрал ответ судьи как JSON: {exc}\nсырой ответ в {run_dir}/judge_raw.txt")
 
     resilience, rows = score(targets, verdicts)
+    fingerprint, attack_models = attack_fingerprint(reports)
 
     result = {
         "binary": binary_name,
@@ -307,15 +336,24 @@ def main():
         "judge_model": args.judge,
         "judge_cost_usd": round(cost, 4) if cost else None,
         "attackers": list(reports),
+        "attack_fingerprint": fingerprint,
+        "attack_models": attack_models,
         "resilience": resilience,
         "targets": rows,
     }
 
-    prev = find_previous(run_dir, binary_name)
-    if prev and prev.get("resilience") is not None and resilience is not None:
+    # Дельта -- только между сопоставимыми замерами (одинаковая атака).
+    comparable, incomparable = find_previous(run_dir, binary_name, fingerprint)
+    comparable = [d for d in comparable if d.get("resilience") is not None]
+    if comparable and resilience is not None:
+        prev = comparable[-1]  # самый свежий сопоставимый
+        same_version = prev.get("version") == version
         result["previous"] = {"version": prev.get("version"), "run": prev.get("run"),
-                              "resilience": prev["resilience"]}
+                              "resilience": prev["resilience"], "same_version": same_version}
         result["delta"] = round(resilience - prev["resilience"], 3)
+    result["incomparable_runs"] = [
+        {"version": d.get("version"), "run": d.get("run"), "resilience": d.get("resilience")}
+        for d in incomparable]
 
     (run_dir / "resilience.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -333,8 +371,23 @@ def main():
     if "delta" in result:
         d = result["delta"]
         p = result["previous"]
-        arrow = "выросла" if d > 0 else ("упала — РЕГРЕССИЯ" if d < 0 else "без изменений")
-        print(f"\n  vs v{p['version']} ({p['resilience']}): дельта {d:+} — стойкость {arrow}")
+        if p["same_version"]:
+            # Та же версия, та же атака -> это повтор: разница = разброс замера, не регрессия.
+            print(f"\n  vs прошлый замер той же версии v{p['version']} ({p['resilience']}): "
+                  f"дельта {d:+} — это разброс замера (одинаковая атака и версия), не регрессия")
+        else:
+            arrow = ("выросла" if d > 0 else "упала — РЕГРЕССИЯ ЗАЩИЩЁННОСТИ" if d < 0
+                     else "без изменений")
+            print(f"\n  vs v{p['version']} ({p['resilience']}) при той же атаке: "
+                  f"дельта {d:+} — стойкость {arrow}")
+    elif result["incomparable_runs"]:
+        print(f"\n  прошлые замеры этого бинаря есть ({len(result['incomparable_runs'])}), "
+              f"но с ДРУГОЙ конфигурацией атаки — дельта не считается (несопоставимо):")
+        for r in result["incomparable_runs"][-3:]:
+            print(f"    v{r['version']} / {r['run']}: стойкость {r['resilience']}")
+        print("  Для сравнения версий повтори атаку той же конфигурацией (модели/промпт/бюджет).")
+    else:
+        print(f"\n  первый замер этой конфигурации — точка отсчёта для будущих сравнений")
     print(f"\n  подробно: {run_dir / 'resilience.json'}")
 
 
