@@ -1040,14 +1040,27 @@ def main():
     if not sample.is_file():
         sys.exit(f"нет такого файла: {sample}")
 
-    # Модель и МАРШРУТ. subscription -- если так предпочтено, модель умеет и токен жив;
-    # иначе litellm. Решаем заранее: от маршрута зависит, нужен ли Sandbox и ключи API.
+    # Модель и МАРШРУТ. Решаем заранее: от маршрута зависит Sandbox и ключи API.
     model_obj = create_model({"name": args.model_name,
                               "litellm_model": args.model,
                               "subscription_model": args.subscription_model})
-    want_sub = (args.prefer_run_type == "subscription"
-                and getattr(model_obj, "supports_subscription", lambda: False)()
-                and (token_expiry_hours() or 0) > 0.2)
+    supports_sub = getattr(model_obj, "supports_subscription", lambda: False)()
+    want_sub = False
+    if args.prefer_run_type == "subscription":
+        if supports_sub:
+            # Модель УМЕЕТ подписку. Протухший токен -- не повод молча уйти в
+            # платный litellm: это неожиданный счёт. Останавливаемся громко.
+            left = token_expiry_hours() or 0
+            if left <= 0.2:
+                sys.exit(f"[!] запрошен subscription, но токен подписки протух "
+                         f"(~{left:.1f} ч). Обнови: claude auth login. "
+                         f"(Тихого отката в платный litellm нет намеренно.)")
+            want_sub = True
+        else:
+            # Модель НЕ умеет подписку (напр. Grok) -- это нормально и ожидаемо,
+            # тихо идём litellm с предупреждением.
+            print(f"[i] {args.model_name or args.model}: subscription не поддерживается "
+                  f"этой моделью, иду litellm", file=sys.stderr)
 
     if not want_sub:
         # litellm-маршрут: нужна модель и ключ. Проверяем до запуска контейнера.
