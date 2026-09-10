@@ -1,0 +1,5 @@
+# Описание модели Grok. Подписочного CLI у xAI нет, поэтому только litellm.
+# При preferred_models_run_type=subscription Grok сам уйдёт в litellm (с предупреждением).
+
+name=grok
+litellm_model=openrouter/x-ai/grok-4.6

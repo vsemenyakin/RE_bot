@@ -1,0 +1,17 @@
+# Описание модели Claude. models = ... в RE_args.txt ссылается на этот файл.
+#
+# Два пути запуска:
+#   litellm_model      -- через OpenRouter (тратит кредиты OpenRouter)
+#   subscription_model -- через подписку Claude Code (claude -p, тратит лимиты Pro)
+# Что из них используется -- решает preferred_models_run_type в RE_args.txt:
+#   subscription -> claude -p (если токен свеж), иначе откат на litellm_model.
+
+name=claude
+litellm_model=openrouter/anthropic/claude-opus-4.8
+
+# Имя для claude -p --model. Алиас "opus" = свежайший Opus (сейчас opus-5).
+# Для конкретной версии укажи точное имя (например claude-opus-4-8), но сверься,
+# что claude его принимает. Учти: если litellm_model=opus-4.8, а тут opus-5 --
+# это РАЗНЫЕ версии, но отпечаток атаки разводит маршруты, так что судья их не
+# сравнивает между собой (сравнивает версии бинаря в пределах одного маршрута).
+subscription_model=opus

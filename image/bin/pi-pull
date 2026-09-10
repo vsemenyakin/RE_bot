@@ -1,0 +1,12 @@
+#!/bin/bash
+# Забрать файл с ЖИВОЙ Pi в /work (для разбора инструментами контейнера).
+#   pi-pull dump.bin            -- из рабочего каталога Pi в /work/dump.bin
+#   pi-pull /tmp/x.log out.log  -- полный путь на Pi -> /work/out.log
+set -u
+source /opt/re/lib/pi_ssh.sh
+_pi_check || exit 2
+SRC="${1:?использование: pi-pull <файл-на-Pi> [имя-в-/work]}"
+case "$SRC" in /*) REMOTE="$SRC";; *) REMOTE="$(_pi_wd)/$SRC";; esac
+NAME="${2:-$(basename "$SRC")}"
+_pi_scp "$(_pi_user)@$RE_PI_HOST:$REMOTE" "/work/$NAME" || exit 1
+echo "забрано в /work/$NAME"

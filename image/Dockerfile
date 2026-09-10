@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gdb-multiarch \
       qemu-user-static \
       less jq git ripgrep vim-common bsdextrautils procps \
+      openssh-client sshpass \
  && rm -rf /var/lib/apt/lists/*
 
 # Желательное: отсутствие пакета в конкретном выпуске не должно ронять сборку.
@@ -125,6 +126,25 @@ RUN set -eux; \
     else \
       echo "SKIP r2: не скачался ${R2_VERSION}" >> /opt/re-build-skipped.txt; \
     fi
+
+# --- Node.js + claude CLI --------------------------------------------------
+# Нужны для атаки через ПОДПИСКУ Claude Code: claude -p бежит прямо в этом
+# контейнере, среди RE-инструментов, авторизуясь смонтированным OAuth-токеном.
+# Node 20 в trixie удовлетворяет требованию claude (>=18). Только для subscription-
+# ветки; litellm-модели claude не используют. Необязательное -- сборку не роняет.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends nodejs npm \
+ && npm install -g @anthropic-ai/claude-code 2>/dev/null \
+ && node --version && claude --version \
+ && rm -rf /var/lib/apt/lists/* /root/.npm \
+ || echo "SKIP node/claude: не установились" >> /opt/re-build-skipped.txt
+
+# Non-root пользователь для claude: Claude Code отказывается работать в
+# автономном режиме (--dangerously-skip-permissions) под root -- защита от
+# случайного сноса системы. subscription-ветка запускает claude от него
+# (--user reuser). litellm-ветка (docker exec от root) его не касается.
+# Инструменты в /opt/re, /opt/venv, /opt/ghidra читаемы/исполнимы всеми.
+RUN useradd -m -u 1000 -s /bin/bash reuser
 
 # --- Наша обвязка ----------------------------------------------------------
 COPY bin/     /opt/re/bin/

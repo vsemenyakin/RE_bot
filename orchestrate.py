@@ -30,35 +30,63 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
-def label_for(model):
-    return model.replace("/", "_").replace(":", "_")
+def parse_model_desc(spec):
+    """Спецификация модели -> dict {name, litellm_model, subscription_model, id}.
+
+    spec -- путь к файлу описания (models/claude.txt) ИЛИ прямое имя litellm-модели
+    (обратная совместимость: openrouter/... трактуется как только-litellm).
+    """
+    p = Path(spec)
+    if p.is_file():
+        d = {"name": "", "litellm_model": "", "subscription_model": ""}
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            d[k.strip()] = v.strip().strip('"').strip("'")
+        d["id"] = d.get("litellm_model") or d.get("subscription_model") or d.get("name") or spec
+        return d
+    return {"name": "", "litellm_model": spec, "subscription_model": "", "id": spec}
 
 
-def run_one(model, sample, run_dir, budget, turns, extra_args, log_path):
-    """Запускает agent.py для одной модели как подпроцесс. Возвращает (model, summary)."""
+def label_for(desc):
+    """Имя рабочего каталога -- ДОЛЖНО совпадать с label в agent.py (тот же приоритет)."""
+    src = desc.get("litellm_model") or desc.get("subscription_model") or desc.get("name") or "model"
+    return src.replace("/", "_").replace(":", "_")
+
+
+def run_one(desc, sample, run_dir, budget, turns, prefer, extra_args, log_path):
+    """Запускает agent.py для одной модели как подпроцесс. Возвращает (id, summary)."""
     cmd = [
         sys.executable, str(HERE / "agent.py"),
         "--sample", str(sample),
-        "--model", model,
         "--run-dir", str(run_dir),
         "--max-usd", str(budget),
         "--max-turns", str(turns),
-    ] + extra_args
+        "--prefer-run-type", prefer,
+    ]
+    if desc.get("name"):
+        cmd += ["--model-name", desc["name"]]
+    if desc.get("litellm_model"):
+        cmd += ["--model", desc["litellm_model"]]
+    if desc.get("subscription_model"):
+        cmd += ["--subscription-model", desc["subscription_model"]]
+    cmd += extra_args
 
     t0 = time.time()
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
 
-    # summary.json пишет сам agent.py; читаем его как результат работы.
-    summary_path = run_dir / label_for(model) / "summary.json"
+    summary_path = run_dir / label_for(desc) / "summary.json"
     if summary_path.is_file():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
     else:
-        summary = {"model": model,
+        summary = {"model": desc["id"],
                    "stop_reason": f"agent.py не оставил summary (код {proc.returncode})"}
     summary["wall_seconds"] = round(time.time() - t0)
     summary["exit_code"] = proc.returncode
-    return model, summary
+    return desc["id"], summary
 
 
 def main():
@@ -67,7 +95,11 @@ def main():
     ap.add_argument("--deps", nargs="*", default=[],
                     help="зависимости бинаря (библиотеки, данные) -- доступны атакующим")
     ap.add_argument("--models", required=True,
-                    help="список моделей через запятую (нотация LiteLLM)")
+                    help="через запятую: пути к файлам описания моделей (models/claude.txt) "
+                         "или прямые имена litellm-моделей")
+    ap.add_argument("--preferred-models-run-type", choices=["litellm", "subscription"],
+                    default="litellm",
+                    help="предпочтительный маршрут для всех моделей (кто умеет)")
     ap.add_argument("--budget-total", type=float, default=10.0,
                     help="общий бюджet в $ на весь прогон, делится поровну между моделями")
     ap.add_argument("--budget-per-model", type=float, default=None,
@@ -86,11 +118,13 @@ def main():
     if not sample.is_file():
         sys.exit(f"нет такого файла: {sample}")
 
-    models = [m.strip() for m in args.models.split(",") if m.strip()]
-    if not models:
+    specs = [m.strip() for m in args.models.split(",") if m.strip()]
+    if not specs:
         sys.exit("не заданы модели")
+    descs = [parse_model_desc(s) for s in specs]
+    models = [d["id"] for d in descs]
 
-    per_model = args.budget_per_model or round(args.budget_total / len(models), 3)
+    per_model = args.budget_per_model or round(args.budget_total / len(descs), 3)
 
     run_id = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     run_dir = Path(args.run_dir).resolve() if args.run_dir else HERE / "runs" / f"ens_{run_id}"
@@ -110,8 +144,9 @@ def main():
 
     print(f"[i] прогон     : {run_dir.name}")
     print(f"[i] бинарь     : {sample.name}")
-    print(f"[i] моделей    : {len(models)}, параллельно {args.parallel}")
-    print(f"[i] бюджет     : ${per_model} на модель, ${round(per_model * len(models), 2)} всего")
+    print(f"[i] моделей    : {len(descs)}, параллельно {args.parallel}")
+    print(f"[i] маршрут    : предпочтительно {args.preferred_models_run_type}")
+    print(f"[i] бюджет     : ${per_model} на модель, ${round(per_model * len(descs), 2)} всего")
     print(f"[i] модели     : {', '.join(models)}\n")
 
     # Манифест пишем сразу, чтобы при обрыве было видно, что запускалось.
@@ -121,6 +156,7 @@ def main():
         "sample": sample.name,
         "sample_bytes": sample.stat().st_size,
         "models": models,
+        "preferred_run_type": args.preferred_models_run_type,
         "budget_per_model": per_model,
         "max_turns": args.max_turns,
         "started": datetime.now().isoformat(timespec="seconds"),
@@ -133,9 +169,10 @@ def main():
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
         futures = {
-            pool.submit(run_one, m, sample, run_dir, per_model, args.max_turns,
-                        extra, run_dir / f"{label_for(m)}.console.log"): m
-            for m in models
+            pool.submit(run_one, d, sample, run_dir, per_model, args.max_turns,
+                        args.preferred_models_run_type, extra,
+                        run_dir / f"{label_for(d)}.console.log"): d["id"]
+            for d in descs
         }
         for fut in concurrent.futures.as_completed(futures):
             model, summary = fut.result()

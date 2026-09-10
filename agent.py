@@ -748,6 +748,206 @@ def run_agent(model, task, sandbox, log_dir, max_turns, max_usd, cmd_timeout,
 
 
 # ---------------------------------------------------------------------------
+# Модели: полиморфный запуск атаки
+# ---------------------------------------------------------------------------
+# ModelParams -- что за модель (из файла описания): name, litellm_model,
+# subscription_model. RunArgs (kwargs метода run) -- как её запускать в этом
+# прогоне: preferred_run_type и всё, что нужно циклу.
+#
+# Базовый класс умеет только litellm-цикл (нынешний run_agent, без изменений).
+# ClaudeModel (шаг 2) добавит run_subscribed и выбор маршрута по preferred_run_type.
+# GenericModel -- пусто: любая модель без своего класса идёт через litellm.
+class BaseModel:
+    def __init__(self, params):
+        self.params = params or {}
+        self.name = self.params.get("name", "")
+
+    def run(self, preferred_run_type="litellm", **run_args):
+        """Точка входа. База умеет только litellm; preferred игнорирует."""
+        return self.run_litellm(**run_args)
+
+    def run_litellm(self, **run_args):
+        # Тонкая обёртка над отлаженным run_agent -- поведение не меняется.
+        return run_agent(**run_args)
+
+
+class GenericModel(BaseModel):
+    """Любая модель, для которой нет специализированного класса. Только litellm."""
+
+    def run(self, preferred_run_type="litellm", **run_args):
+        if preferred_run_type and preferred_run_type != "litellm":
+            print(f"[i] {self.name or run_args.get('model','?')}: режим "
+                  f"'{preferred_run_type}' не поддерживается этой моделью, иду litellm",
+                  file=sys.stderr)
+        return self.run_litellm(**run_args)
+
+
+CLAUDE_CRED_PATH = Path.home() / ".claude" / ".credentials.json"
+
+# Инструкция claude про Pi в subscription-режиме: тут он работает ВНУТРИ
+# контейнера и ходит на живую Pi через bash-обёртки (дефис), а не через
+# pi_exec-инструменты agent.py (те для litellm-режима). Разводим явно.
+SUBSCRIPTION_PI_NOTE = """
+
+## Доступ к настоящей Raspberry Pi (важно для этого режима)
+Ты работаешь ВНУТРИ контейнера с RE-инструментами. Для живой Pi используй
+bash-обёртки (не pi_exec из TOOLS.md -- то для другого режима):
+  pi-exec "команда"      -- выполнить команду на живой Pi по SSH
+  pi-push /work/файл     -- скопировать файл на Pi
+  pi-pull файл [имя]     -- забрать файл с Pi в /work
+Живая Pi доступна, только если задан RE_PI_HOST (проверь: `echo $RE_PI_HOST`).
+Динамику (запуск, gdb, рантайм-дамп) веди на живой Pi -- под qemu защита
+kerbside даёт мусор. Не забудь LD_LIBRARY_PATH к каталогу с библиотеками.
+"""
+
+
+def token_expiry_hours(cred_path=CLAUDE_CRED_PATH):
+    """Часов до истечения OAuth-токена подписки; None если файла/поля нет."""
+    try:
+        import time
+        d = json.loads(Path(cred_path).read_text(encoding="utf-8"))["claudeAiOauth"]
+        return (d["expiresAt"] / 1000 - time.time()) / 3600
+    except Exception:
+        return None
+
+
+class ClaudeModel(BaseModel):
+    """Claude: умеет и litellm (через OpenRouter), и subscription (claude -p).
+
+    subscription-маршрут запускает claude -p ВНУТРИ контейнера re-workbench --
+    Claude Code сам ведёт цикл, пользуется нашими инструментами и пишет
+    report.md/findings.jsonl в /work (тот же формат, что читает judge.py).
+    """
+
+    def supports_subscription(self):
+        return bool(self.params.get("subscription_model"))
+
+    def run(self, preferred_run_type="litellm", **run_args):
+        if preferred_run_type == "subscription" and self.supports_subscription():
+            return self.run_subscribed(**run_args)
+        if preferred_run_type == "subscription":
+            print(f"[i] {self.name}: subscription не настроен (нет subscription_model), "
+                  f"иду litellm", file=sys.stderr)
+        return self.run_litellm(**run_args)
+
+    def run_subscribed(self, work, task, system_prompt, image="re-workbench:latest",
+                       deps=(), pi=None, max_usd=None, cred_path=CLAUDE_CRED_PATH,
+                       **ignore):
+        """Запуск claude -p в контейнере через подписку. Возвращает summary-словарь."""
+        import time
+        t0 = time.time()
+        model_id = self.params.get("subscription_model")
+        work = Path(work)
+
+        # Свежесть токена: рантайм-провал подписки -- громкая ошибка, не тихий fallback.
+        left = token_expiry_hours(cred_path)
+        if left is None:
+            return {"model": model_id, "stop_reason": "нет токена подписки: "
+                    f"{cred_path} (сделай claude auth login)"}
+        if left < 0.2:
+            return {"model": model_id, "stop_reason":
+                    f"токен подписки почти истёк (~{left:.1f} ч) -- claude auth login"}
+
+        # Полный промпт claude: наша методика + инструкция про Pi-обёртки этого режима.
+        full_prompt = system_prompt + SUBSCRIPTION_PI_NOTE
+
+        cmd = [
+            "docker", "run", "--rm",
+            "--user", "reuser", "-e", "HOME=/home/reuser",
+            "-v", f"{Path(cred_path).resolve()}:/home/reuser/.claude/.credentials.json",
+            "-v", f"{work.resolve()}:/work",
+            "-e", "RE_AGENT=subscription-claude",
+        ]
+        # Pi-креды пробрасываем внутрь, чтобы pi-exec из контейнера достучался до Pi.
+        if pi is not None:
+            cmd += ["-e", f"RE_PI_HOST={pi.host}", "-e", f"RE_PI_USER={pi.user}",
+                    "-e", f"RE_PI_PORT={pi.port}",
+                    "-e", f"RE_PI_WORKDIR={pi.workdir}"]
+            if pi.password:
+                cmd += ["-e", f"RE_PI_PASSWORD={pi.password}"]
+            if pi.key_path:
+                cmd += ["-e", f"RE_PI_KEY={pi.key_path}"]
+        cmd += [
+            image,
+            "claude", "-p", task,
+            "--model", model_id,
+            "--append-system-prompt", full_prompt,
+            "--output-format", "json",
+            "--dangerously-skip-permissions",
+        ]
+
+        print(f"[i] {model_id}: subscription-маршрут (claude -p в контейнере), "
+              f"токен ~{left:.1f} ч, Pi={'да' if pi else 'нет'}", flush=True)
+
+        transcript = (work / "transcript.jsonl").open("w", encoding="utf-8")
+        transcript.write(json.dumps({"kind": "subscribed_start", "model": model_id,
+                                     "task": task}, ensure_ascii=False) + "\n")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+        except Exception as exc:
+            transcript.close()
+            return {"model": model_id, "stop_reason": f"не запустился claude: {exc}"}
+
+        raw = proc.stdout or ""
+        (work / "claude_raw.json").write_text(raw + "\n---STDERR---\n" + (proc.stderr or ""),
+                                              encoding="utf-8")
+        transcript.write(json.dumps({"kind": "subscribed_done",
+                                     "exit_code": proc.returncode}, ensure_ascii=False) + "\n")
+        transcript.close()
+
+        # Разбор JSON-вывода claude Code.
+        turns = None
+        cost = None
+        stop_reason = f"claude -p код возврата {proc.returncode}"
+        try:
+            d = json.loads(raw)
+            turns = d.get("num_turns")
+            cost = d.get("total_cost_usd")
+            if d.get("is_error"):
+                stop_reason = "claude ошибка: " + str(d.get("result", ""))[:200]
+            else:
+                stop_reason = "claude завершил"
+        except Exception:
+            if proc.returncode != 0:
+                stop_reason = "claude упал: " + (proc.stderr or raw)[:200]
+
+        findings = 0
+        ff = work / "findings.jsonl"
+        if ff.is_file():
+            findings = sum(1 for ln in ff.read_text(encoding="utf-8").splitlines() if ln.strip())
+
+        import hashlib
+        def _sha(s):
+            return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
+        return {
+            "model": model_id,
+            "turns": turns,
+            "usd": round(cost, 4) if isinstance(cost, (int, float)) else cost,
+            "seconds": round(time.time() - t0),
+            "stop_reason": stop_reason,
+            "pi": f"{pi.user}@{pi.host}" if pi else None,
+            "attack": {
+                "profile": "subscription-claude",
+                "prompt_sha": _sha(system_prompt),
+                "task_sha": _sha(task),
+                "subscription_model": model_id,
+                "pi_available": pi is not None,
+            },
+            "findings": findings,
+            "report": (work / "report.md").is_file(),
+        }
+
+
+def create_model(params):
+    """Фабрика по имени модели из файла описания."""
+    name = (params or {}).get("name", "")
+    if name == "claude":
+        return ClaudeModel(params)
+    return GenericModel(params)
+
+
+# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Реверс-инжиниринг одной моделью")
     ap.add_argument("--sample", help="путь к бинарю на хосте")
@@ -755,8 +955,15 @@ def main():
                     help="доп. файлы, нужные бинарю (библиотеки .so, данные): "
                          "копируются в /work с исходными именами")
     ap.add_argument("--model", default="",
-                    help="имя модели для LiteLLM, например anthropic/claude-opus-4-5 "
-                         "или openrouter/google/gemini-2.5-pro")
+                    help="litellm_model: имя модели для LiteLLM (через OpenRouter и т.п.)")
+    ap.add_argument("--model-name", default="",
+                    help="имя модели для фабрики классов (claude/grok/...); из файла описания")
+    ap.add_argument("--subscription-model", default="",
+                    help="имя модели для запуска по подписке (claude -p), напр. opus")
+    ap.add_argument("--prefer-run-type", choices=["litellm", "subscription"],
+                    default="litellm",
+                    help="предпочтительный маршрут: subscription (подписка) там, где модель "
+                         "умеет; иначе litellm")
     ap.add_argument("--task", default=(
         "Вскрой защиту этого бинаря. Извлеки все зашитые числовые константы "
         "(пороги, коэффициенты, параметры настройки) с ТОЧНЫМИ значениями и "
@@ -826,38 +1033,43 @@ def main():
         print(f"\n[+] Pi доступна и готова, рабочий каталог {pi.workdir}")
         return
 
-    if not args.sample or not args.model:
-        sys.exit("нужны --sample и --model (или --check-pi для проверки связи с Pi)")
+    if not args.sample:
+        sys.exit("нужен --sample (или --check-pi для проверки связи с Pi)")
 
     sample = Path(args.sample).resolve()
     if not sample.is_file():
         sys.exit(f"нет такого файла: {sample}")
 
-    # Ключи спрашиваем до запуска контейнера: узнать о забытом ключе на первом
-    # обращении к API, потратив минуту на старт Ghidra, обидно.
-    # Имена переменных знает LiteLLM -- он выводит их из приставки в имени модели.
-    import litellm
-    # LiteLLM печатает подсказки и баннеры прямо в stderr, мимо исключений;
-    # перехватить их из кода нельзя, отключается только этим флагом.
-    litellm.suppress_debug_info = True
+    # Модель и МАРШРУТ. subscription -- если так предпочтено, модель умеет и токен жив;
+    # иначе litellm. Решаем заранее: от маршрута зависит, нужен ли Sandbox и ключи API.
+    model_obj = create_model({"name": args.model_name,
+                              "litellm_model": args.model,
+                              "subscription_model": args.subscription_model})
+    want_sub = (args.prefer_run_type == "subscription"
+                and getattr(model_obj, "supports_subscription", lambda: False)()
+                and (token_expiry_hours() or 0) > 0.2)
 
-    # Модель без поддержки вызова инструментов в этом цикле бесполезна: она
-    # не сможет ничего выполнить и просто поговорит с вами.
-    try:
-        if not litellm.supports_function_calling(model=args.model):
-            print(f"[!] LiteLLM не подтверждает поддержку инструментов у {args.model}.\n"
-                  f"    Если модель их не умеет, она не выполнит ни одной команды.",
-                  file=sys.stderr)
-    except Exception:
-        pass
+    if not want_sub:
+        # litellm-маршрут: нужна модель и ключ. Проверяем до запуска контейнера.
+        if not args.model:
+            sys.exit("для litellm-маршрута нужен --model (litellm_model)")
+        import litellm
+        # LiteLLM печатает баннеры в stderr мимо исключений -- отключаем.
+        litellm.suppress_debug_info = True
+        try:
+            if not litellm.supports_function_calling(model=args.model):
+                print(f"[!] LiteLLM не подтверждает поддержку инструментов у {args.model}.",
+                      file=sys.stderr)
+        except Exception:
+            pass
+        env = litellm.validate_environment(model=args.model)
+        if not env.get("keys_in_environment"):
+            missing = " или ".join(env.get("missing_keys") or ["?"])
+            sys.exit(f"не задан ключ для {args.model}: нужна переменная {missing}\n"
+                     f"впишите её в .env (образец -- .env.example)")
 
-    env = litellm.validate_environment(model=args.model)
-    if not env.get("keys_in_environment"):
-        missing = " или ".join(env.get("missing_keys") or ["?"])
-        sys.exit(f"не задан ключ для {args.model}: нужна переменная {missing}\n"
-                 f"впишите её в .env (образец -- .env.example)")
-
-    label = args.model.replace("/", "_").replace(":", "_")
+    label_src = args.model or args.subscription_model or args.model_name or "model"
+    label = label_src.replace("/", "_").replace(":", "_")
     run_dir = Path(args.run_dir).resolve() if args.run_dir else Path("runs") / run_id
     work = run_dir / label
     work.mkdir(parents=True, exist_ok=True)
@@ -882,19 +1094,12 @@ def main():
     if dep_names:
         print(f"[i] зависимости: {', '.join(dep_names)} (в /work)")
 
-    sandbox = Sandbox(
-        image=args.image,
-        workdir=work,
-        name=f"re-{label[:30]}-{uuid.uuid4().hex[:6]}",
-        agent_label=args.model,
-    )
-
-    print(f"[i] модель     : {args.model}")
+    print(f"[i] маршрут    : {'subscription (claude -p)' if want_sub else 'litellm'}")
+    print(f"[i] модель     : {args.subscription_model if want_sub else args.model}")
     print(f"[i] образец    : {sample.name} -> {target}")
     print(f"[i] каталог    : {work}")
 
-    # Pi необязательна. Если не настроена или отключена флагом -- модель о ней
-    # даже не узнает, чтобы не тратила шаги на недоступное.
+    # Pi необязательна, нужна обоим маршрутам (креды/доступ к живой Pi).
     pi = None if args.no_pi else PiDevice.from_env(run_id)
     if pi is not None:
         try:
@@ -906,46 +1111,66 @@ def main():
             pi = None
     print(f"[i] Pi         : {pi.host if pi else 'нет, только эмуляция'}")
 
-    sandbox.start()
-    print(f"[i] контейнер  : {sandbox.name}")
-    try:
-        summary = run_agent(args.model, args.task, sandbox, work,
-                            args.max_turns, args.max_usd, args.cmd_timeout,
-                            args.max_tokens, args.max_retries, args.retry_delay,
-                            pi=pi, wrap_at=args.wrap_at,
-                            use_cache=not args.no_cache, deps=dep_names)
-    except KeyboardInterrupt:
-        summary = {"model": args.model, "stop_reason": "прервано пользователем"}
-    except Exception as exc:
-        # Сводку пишем в любом случае: без неё непонятно даже, сколько потрачено.
-        import traceback
-        traceback.print_exc()
-        summary = {"model": args.model,
-                   "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
-    finally:
-        sandbox.stop(keep=args.keep_container)
-        if pi is not None:
-            pi.close()
-    summary["pi"] = f"{pi.user}@{pi.host}" if pi else None
+    if want_sub:
+        # subscription-маршрут: своего контейнера (claude -p) достаточно, Sandbox не нужен.
+        # run_subscribed сам формирует полный summary (attack/findings/report/pi).
+        try:
+            summary = model_obj.run(
+                preferred_run_type="subscription",
+                work=work, task=args.task, system_prompt=SYSTEM_PROMPT,
+                image=args.image, deps=dep_names, pi=pi, max_usd=args.max_usd)
+        except KeyboardInterrupt:
+            summary = {"model": args.subscription_model, "stop_reason": "прервано пользователем"}
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            summary = {"model": args.subscription_model,
+                       "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
+        finally:
+            if pi is not None:
+                pi.close()
+    else:
+        sandbox = Sandbox(
+            image=args.image, workdir=work,
+            name=f"re-{label[:30]}-{uuid.uuid4().hex[:6]}", agent_label=args.model,
+        )
+        sandbox.start()
+        print(f"[i] контейнер  : {sandbox.name}")
+        try:
+            summary = model_obj.run(
+                preferred_run_type="litellm",
+                model=args.model, task=args.task, sandbox=sandbox, log_dir=work,
+                max_turns=args.max_turns, max_usd=args.max_usd, cmd_timeout=args.cmd_timeout,
+                max_tokens=args.max_tokens, max_retries=args.max_retries,
+                retry_delay=args.retry_delay, pi=pi, wrap_at=args.wrap_at,
+                use_cache=not args.no_cache, deps=dep_names)
+        except KeyboardInterrupt:
+            summary = {"model": args.model, "stop_reason": "прервано пользователем"}
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            summary = {"model": args.model,
+                       "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
+        finally:
+            sandbox.stop(keep=args.keep_container)
+            if pi is not None:
+                pi.close()
+        # litellm-путь: run_agent даёт частичный summary, дополняем его.
+        summary["pi"] = f"{pi.user}@{pi.host}" if pi else None
+        import hashlib
+        def _sha(s):
+            return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
+        summary["attack"] = {
+            "profile": "litellm",
+            "prompt_sha": _sha(SYSTEM_PROMPT),
+            "task_sha": _sha(args.task),
+            "max_turns": args.max_turns,
+            "max_usd": args.max_usd,
+            "pi_available": pi is not None,
+        }
+        summary["findings"] = sum(1 for _ in (work / "findings.jsonl").open(encoding="utf-8"))
+        summary["report"] = (work / "report.md").is_file()
 
-    # Конфигурация атаки: по ней судья решает, сопоставимы ли два замера.
-    # Сравнивать стойкость версий бинаря можно только при ОДИНАКОВОЙ атаке;
-    # смена промпта/моделей/бюджета -- другая атака, дельта между ними не значит
-    # изменения защищённости. Фиксируем то, что влияет на силу атаки.
-    import hashlib
-    def _sha(s):
-        return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
-    summary["attack"] = {
-        "prompt_sha": _sha(SYSTEM_PROMPT),
-        "task_sha": _sha(args.task),
-        "max_turns": args.max_turns,
-        "max_usd": args.max_usd,
-        "pi_available": pi is not None,
-    }
-
-    findings = sum(1 for _ in (work / "findings.jsonl").open(encoding="utf-8"))
-    summary["findings"] = findings
-    summary["report"] = (work / "report.md").is_file()
     (work / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 

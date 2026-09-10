@@ -1,0 +1,11 @@
+#!/bin/bash
+# Выполнить команду на ЖИВОЙ Raspberry Pi по SSH (из контейнера).
+# Команда исполняется в рабочем каталоге Pi (создаётся при первом обращении).
+#   pi-exec "uname -a"
+#   pi-exec "LD_LIBRARY_PATH=. ./sample scene.krw"
+set -u
+source /opt/re/lib/pi_ssh.sh
+_pi_check || exit 2
+CMD="${1:?использование: pi-exec \"команда\"}"
+WD=$(_pi_wd)
+_pi_ssh "$(_pi_user)@$RE_PI_HOST" "mkdir -p $(printf %q "$WD") && cd $(printf %q "$WD") && $CMD"

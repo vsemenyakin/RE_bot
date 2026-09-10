@@ -9,10 +9,20 @@ sample = samples/kerbside
 # Зависимости бинаря через пробел: библиотеки, данные, входные файлы.
 deps = samples/libonnxruntime.so samples/vehicle.onnx samples/scene.krw
 
-# Модели через запятую (нотация LiteLLM). Точные id -- openrouter.ai/models.
-models = openrouter/anthropic/claude-opus-4.8,openrouter/x-ai/grok-4.6
+# Модели через запятую: пути к файлам описания (models/claude.txt и т.п.).
+# Можно и прямые litellm-имена (openrouter/...) -- тогда только litellm.
+models = models/claude.txt,models/grok.txt
 
-# Общий бюджет в $, делится поровну между моделями.
+# Предпочтительный маршрут запуска:
+#   litellm      -- все модели через OpenRouter (тратит кредиты, стабильно)
+#   subscription -- кто умеет (Claude), идёт через подписку Pro (claude -p,
+#                   дешевле); кто не умеет (Grok) -- через litellm.
+# Требует свежий токен: claude auth login. Только для ДОВЕРЕННОГО бинаря
+# (контейнер Claude идёт с сетью и доступом к Pi).
+preferred_models_run_type = subscription
+
+# Общий бюджет в $, делится поровну. Для subscription-моделей бюджет в деньгах
+# не тратится (идёт из лимитов подписки), но для litellm-моделей (Grok) -- да.
 budget-total = 6
 
 # Метка версии бинаря -- по ней судья сравнивает регрессии между версиями.

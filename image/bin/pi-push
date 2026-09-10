@@ -1,0 +1,15 @@
+#!/bin/bash
+# Скопировать файл из /work на ЖИВУЮ Pi (в её рабочий каталог) и сделать исполняемым.
+#   pi-push /work/sample
+#   pi-push /work/libonnxruntime.so
+set -u
+source /opt/re/lib/pi_ssh.sh
+_pi_check || exit 2
+F="${1:?использование: pi-push <файл>}"
+[ -f "$F" ] || { echo "нет файла: $F" >&2; exit 1; }
+WD=$(_pi_wd); U=$(_pi_user); base=$(basename "$F")
+# Каталог на Pi должен существовать до scp.
+_pi_ssh "$U@$RE_PI_HOST" "mkdir -p $(printf %q "$WD")" || exit 1
+_pi_scp "$F" "$U@$RE_PI_HOST:$WD/$base" || exit 1
+_pi_ssh "$U@$RE_PI_HOST" "chmod +x $(printf %q "$WD/$base")" 2>/dev/null || true
+echo "на Pi: $WD/$base"
