@@ -1050,6 +1050,60 @@ def build_parser():
     return ap
 
 
+def decide_route(args):
+    """Создаёт объект модели и решает маршрут прогона. Возвращает (model_obj,
+    want_sub). Маршрут subscription -- если он предпочтён И модель это умеет
+    (есть subscription_model); иначе litellm. Свежесть токена здесь НЕ проверяем:
+    это забота ClaudeModel.run_subscribed (она вернёт summary со stop_reason, без
+    отката в платный litellm), чтобы проверка жила там, где ей место."""
+    model_obj = create_model({"name": args.model_name,
+                              "litellm_model": args.model,
+                              "subscription_model": args.subscription_model})
+    supports_sub = getattr(model_obj, "supports_subscription", lambda: False)()
+    want_sub = args.prefer_run_type == "subscription" and supports_sub
+    if args.prefer_run_type == "subscription" and not supports_sub:
+        # Модель не умеет подписку (напр. Grok) -- нормально, тихо идём litellm.
+        print(f"[i] {args.model_name or args.model}: subscription не поддерживается "
+              f"этой моделью, иду litellm", file=sys.stderr)
+    return model_obj, want_sub
+
+
+def prepare_workdir(args, sample, run_id, want_sub):
+    """Готовит рабочий каталог прогона: имя-метка, каталог, копия образца (модель
+    ковыряет свой экземпляр, не оригинал), пустой findings.jsonl и копии
+    зависимостей с ИСХОДНЫМИ именами (.so ищется по SONAME, данные по имени --
+    переименовывать нельзя). Печатает баннер прогона. Возвращает (work, label,
+    dep_names)."""
+    import shutil
+    label_src = args.model or args.subscription_model or args.model_name or "model"
+    label = label_src.replace("/", "_").replace(":", "_")
+    run_dir = Path(args.run_dir).resolve() if args.run_dir else Path("runs") / run_id
+    work = run_dir / label
+    work.mkdir(parents=True, exist_ok=True)
+
+    target = work / "sample"
+    target.write_bytes(sample.read_bytes())
+    (work / "findings.jsonl").touch()
+
+    dep_names = []
+    for dep in args.deps:
+        dp = Path(dep).resolve()
+        if not dp.is_file():
+            sys.exit(f"нет файла зависимости: {dp}")
+        # copyfile потоково -- зависимости бывают в сотни МБ (входные данные),
+        # read_bytes загрузил бы их целиком в память.
+        shutil.copyfile(dp, work / dp.name)
+        dep_names.append(dp.name)
+    if dep_names:
+        print(f"[i] зависимости: {', '.join(dep_names)} (в /work)")
+
+    print(f"[i] маршрут    : {'subscription (claude -p)' if want_sub else 'litellm'}")
+    print(f"[i] модель     : {args.subscription_model if want_sub else args.model}")
+    print(f"[i] образец    : {sample.name} -> {target}")
+    print(f"[i] каталог    : {work}")
+    return work, label, dep_names
+
+
 def preflight_litellm(model):
     """Проверяет пригодность litellm-маршрута ДО запуска контейнера: задана ли
     модель, поддерживает ли она инструменты, есть ли ключ API. Любая проблема --
@@ -1134,55 +1188,13 @@ def main():
         sys.exit(f"нет такого файла: {sample}")
 
     # Модель и МАРШРУТ. Решаем заранее: от маршрута зависит Sandbox и ключи API.
-    model_obj = create_model({"name": args.model_name,
-                              "litellm_model": args.model,
-                              "subscription_model": args.subscription_model})
-    supports_sub = getattr(model_obj, "supports_subscription", lambda: False)()
-    # Маршрут: subscription, если так предпочтено и модель это УМЕЕТ. Свежесть
-    # токена здесь НЕ проверяем -- это забота самой ClaudeModel.run_subscribed
-    # (она вернёт summary со stop_reason при протухшем токене, БЕЗ отката в
-    # платный litellm). Так проверка живёт там, где ей место, а её результат
-    # доходит до пользователя через summary.json -> вывод orchestrate.
-    want_sub = args.prefer_run_type == "subscription" and supports_sub
-    if args.prefer_run_type == "subscription" and not supports_sub:
-        # Модель не умеет подписку (напр. Grok) -- нормально, тихо идём litellm.
-        print(f"[i] {args.model_name or args.model}: subscription не поддерживается "
-              f"этой моделью, иду litellm", file=sys.stderr)
+    model_obj, want_sub = decide_route(args)
 
     if not want_sub:
         # litellm-маршрут: модель и ключ нужны до запуска контейнера.
         preflight_litellm(args.model)
 
-    label_src = args.model or args.subscription_model or args.model_name or "model"
-    label = label_src.replace("/", "_").replace(":", "_")
-    run_dir = Path(args.run_dir).resolve() if args.run_dir else Path("runs") / run_id
-    work = run_dir / label
-    work.mkdir(parents=True, exist_ok=True)
-
-    # Копия образца: пусть модель ковыряет свой экземпляр, а не оригинал.
-    target = work / "sample"
-    target.write_bytes(sample.read_bytes())
-    (work / "findings.jsonl").touch()
-
-    # Зависимости бинаря (библиотеки, данные) -- копируем с ИСХОДНЫМИ именами:
-    # .so ищется по SONAME, данные по имени файла, переименовывать нельзя.
-    import shutil
-    dep_names = []
-    for dep in args.deps:
-        dp = Path(dep).resolve()
-        if not dp.is_file():
-            sys.exit(f"нет файла зависимости: {dp}")
-        # copyfile потоково -- зависимости бывают в сотни МБ (входные данные),
-        # read_bytes загрузил бы их целиком в память.
-        shutil.copyfile(dp, work / dp.name)
-        dep_names.append(dp.name)
-    if dep_names:
-        print(f"[i] зависимости: {', '.join(dep_names)} (в /work)")
-
-    print(f"[i] маршрут    : {'subscription (claude -p)' if want_sub else 'litellm'}")
-    print(f"[i] модель     : {args.subscription_model if want_sub else args.model}")
-    print(f"[i] образец    : {sample.name} -> {target}")
-    print(f"[i] каталог    : {work}")
+    work, label, dep_names = prepare_workdir(args, sample, run_id, want_sub)
 
     # Pi необязательна, нужна обоим маршрутам (креды/доступ к живой Pi).
     pi = setup_pi(args, run_id)
