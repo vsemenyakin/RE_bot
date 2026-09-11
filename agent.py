@@ -970,9 +970,6 @@ class ClaudeModel(BaseModel):
         if ff.is_file():
             findings = sum(1 for ln in ff.read_text(encoding="utf-8").splitlines() if ln.strip())
 
-        import hashlib
-        def _sha(s):
-            return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
         return {
             "model": model_id,
             "turns": turns,
@@ -980,16 +977,32 @@ class ClaudeModel(BaseModel):
             "seconds": round(time.time() - t0),
             "stop_reason": stop_reason,
             "pi": f"{pi.user}@{pi.host}" if pi else None,
-            "attack": {
-                "profile": "subscription-claude",
-                "prompt_sha": _sha(system_prompt),
-                "task_sha": _sha(task),
-                "subscription_model": model_id,
-                "pi_available": pi is not None,
-            },
+            "attack": attack_fingerprint("subscription-claude", system_prompt, task, pi,
+                                         subscription_model=model_id),
             "findings": findings,
             "report": (work / "report.md").is_file(),
         }
+
+
+def sha12(s):
+    """Первые 12 hex sha256 -- компактный отпечаток промпта/задачи."""
+    import hashlib
+    return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
+
+
+def attack_fingerprint(profile, system_prompt, task, pi, **extra):
+    """Отпечаток атаки для судьи: сравнивать между собой можно ТОЛЬКО прогоны с
+    одинаковым fingerprint (тот же промпт, задача, режим). profile разводит
+    маршруты (litellm vs subscription-claude), **extra -- поля, специфичные для
+    маршрута (max_turns/max_usd у litellm, subscription_model у подписки)."""
+    fp = {
+        "profile": profile,
+        "prompt_sha": sha12(system_prompt),
+        "task_sha": sha12(task),
+        "pi_available": pi is not None,
+    }
+    fp.update(extra)
+    return fp
 
 
 def create_model(params):
@@ -1207,17 +1220,8 @@ def run_litellm_route(args, model_obj, work, label, dep_names, pi):
             pi.close()
     # litellm-путь: run_agent даёт частичный summary, дополняем его.
     summary["pi"] = f"{pi.user}@{pi.host}" if pi else None
-    import hashlib
-    def _sha(s):
-        return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
-    summary["attack"] = {
-        "profile": "litellm",
-        "prompt_sha": _sha(SYSTEM_PROMPT),
-        "task_sha": _sha(args.task),
-        "max_turns": args.max_turns,
-        "max_usd": args.max_usd,
-        "pi_available": pi is not None,
-    }
+    summary["attack"] = attack_fingerprint("litellm", SYSTEM_PROMPT, args.task, pi,
+                                           max_turns=args.max_turns, max_usd=args.max_usd)
     summary["findings"] = sum(1 for _ in (work / "findings.jsonl").open(encoding="utf-8"))
     summary["report"] = (work / "report.md").is_file()
     return summary
