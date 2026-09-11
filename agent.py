@@ -1001,7 +1001,9 @@ def create_model(params):
 
 
 # ---------------------------------------------------------------------------
-def main():
+def build_parser():
+    """Собирает CLI-парсер agent.py. Вынесено из main() -- один список всех
+    аргументов запуска, отдельно от логики самого запуска."""
     ap = argparse.ArgumentParser(description="Реверс-инжиниринг одной моделью")
     ap.add_argument("--sample", help="путь к бинарю на хосте")
     ap.add_argument("--deps", nargs="*", default=[],
@@ -1045,7 +1047,12 @@ def main():
                     help="не давать модели доступ к настоящей Pi, даже если она настроена")
     ap.add_argument("--check-pi", action="store_true",
                     help="проверить связь с Pi и выйти (--sample и --model не нужны)")
-    args = ap.parse_args()
+    return ap
+
+
+# ---------------------------------------------------------------------------
+def main():
+    args = build_parser().parse_args()
 
     try:
         from dotenv import load_dotenv
