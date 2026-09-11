@@ -218,6 +218,33 @@ class PiDevice:
             except Exception:
                 pass
 
+    def check(self):
+        """Диагностика готовности Pi: подключается, гоняет набор команд, печатает
+        результат по каждой. Возвращает число проваленных команд (0 -- всё в
+        порядке). Соединиться не удалось -> пробрасывает исключение: решение о
+        выходе принимает вызывающий (это граница CLI, не дело устройства).
+        """
+        checks = [
+            ("uname -a", "ядро и архитектура"),
+            ("cat /etc/os-release | grep PRETTY_NAME", "версия ОС"),
+            ("nproc", "ядер CPU"),
+            ("df -h / | tail -1", "место на диске"),
+            ("pwd", "рабочий каталог создан"),
+            ("command -v strace ltrace gdb || echo '(нет ни strace, ни ltrace, ни gdb)'",
+             "средства динамического анализа"),
+        ]
+        failed = 0
+        try:
+            self.connect()
+            for cmd, label in checks:
+                code, out = self.exec(cmd, timeout=20)
+                mark = "  " if code == 0 else "!!"
+                print(f"{mark} {label}:\n     {out.strip() or '(пусто)'}")
+                if code != 0:
+                    failed += 1
+        finally:
+            self.close()
+        return failed
 
 def truncate(text):
     """Обрезает середину длинного вывода: голова и хвост информативнее всего."""
@@ -1032,28 +1059,10 @@ def main():
         pi = PiDevice.from_env(run_id)
         if pi is None:
             sys.exit("RE_PI_HOST не задан -- Pi не настроена (см. .env.example)")
-        failed = 0
         try:
-            pi.connect()
-            checks = [
-                ("uname -a", "ядро и архитектура"),
-                ("cat /etc/os-release | grep PRETTY_NAME", "версия ОС"),
-                ("nproc", "ядер CPU"),
-                ("df -h / | tail -1", "место на диске"),
-                ("pwd", "рабочий каталог создан"),
-                ("command -v strace ltrace gdb || echo '(нет ни strace, ни ltrace, ни gdb)'",
-                 "средства динамического анализа"),
-            ]
-            for cmd, label in checks:
-                code, out = pi.exec(cmd, timeout=20)
-                mark = "  " if code == 0 else "!!"
-                print(f"{mark} {label}:\n     {out.strip() or '(пусто)'}")
-                if code != 0:
-                    failed += 1
+            failed = pi.check()
         except Exception as exc:
             sys.exit(f"[!] подключиться не удалось: {exc}")
-        finally:
-            pi.close()
         if failed:
             sys.exit(f"\n[!] команд с ошибкой: {failed} -- связь есть, но среда не в порядке")
         print(f"\n[+] Pi доступна и готова, рабочий каталог {pi.workdir}")
