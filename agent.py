@@ -812,11 +812,18 @@ kerbside даёт мусор. Не забудь LD_LIBRARY_PATH к катало�
 
 
 def token_expiry_hours(cred_path=CLAUDE_CRED_PATH):
-    """Часов до истечения OAuth-токена подписки; None если файла/поля нет."""
+    """Часов до истечения REFRESH-токена подписки; None если файла/поля нет.
+
+    Смотрим именно на refresh (~28 дней), а НЕ на access (~8 ч): пока refresh жив,
+    claude сам обновляет протухший access по нему, без браузера. Блокировать
+    прогон и требовать `claude auth login` нужно только когда мёртв refresh --
+    тогда без браузера токен не восстановить. Проверка по access отвергала бы
+    прогон каждые 8 ч, хотя claude мог обновиться сам.
+    """
     try:
         import time
         d = json.loads(Path(cred_path).read_text(encoding="utf-8"))["claudeAiOauth"]
-        return (d["expiresAt"] / 1000 - time.time()) / 3600
+        return (d["refreshTokenExpiresAt"] / 1000 - time.time()) / 3600
     except Exception:
         return None
 
@@ -849,14 +856,16 @@ class ClaudeModel(BaseModel):
         model_id = self.params.get("subscription_model")
         work = Path(work)
 
-        # Свежесть токена: рантайм-провал подписки -- громкая ошибка, не тихий fallback.
+        # Работоспособность токена по REFRESH (~28 дней): пока он жив, claude сам
+        # обновит протухший access. Мёртв refresh -> нужен браузерный login.
         left = token_expiry_hours(cred_path)
         if left is None:
             return {"model": model_id, "stop_reason": "нет токена подписки: "
                     f"{cred_path} (сделай claude auth login)"}
         if left < 0.2:
             return {"model": model_id, "stop_reason":
-                    f"токен подписки почти истёк (~{left:.1f} ч) -- claude auth login"}
+                    f"refresh-токен подписки истёк (~{left:.1f} ч) -- нужен браузерный "
+                    f"claude auth login (это раз в ~28 дней)"}
 
         # Полный промпт claude: наша методика + инструкция про Pi-обёртки этого режима.
         full_prompt = system_prompt + SUBSCRIPTION_PI_NOTE
