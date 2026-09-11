@@ -1050,6 +1050,57 @@ def build_parser():
     return ap
 
 
+def preflight_litellm(model):
+    """Проверяет пригодность litellm-маршрута ДО запуска контейнера: задана ли
+    модель, поддерживает ли она инструменты, есть ли ключ API. Любая проблема --
+    ранний sys.exit с понятным сообщением, чтобы не поднимать зря контейнер."""
+    if not model:
+        sys.exit("для litellm-маршрута нужен --model (litellm_model)")
+    import litellm
+    # LiteLLM печатает баннеры в stderr мимо исключений -- отключаем.
+    litellm.suppress_debug_info = True
+    try:
+        if not litellm.supports_function_calling(model=model):
+            print(f"[!] LiteLLM не подтверждает поддержку инструментов у {model}.",
+                  file=sys.stderr)
+    except Exception:
+        pass
+    env = litellm.validate_environment(model=model)
+    if not env.get("keys_in_environment"):
+        missing = " или ".join(env.get("missing_keys") or ["?"])
+        sys.exit(f"не задан ключ для {model}: нужна переменная {missing}\n"
+                 f"впишите её в .env (образец -- .env.example)")
+
+
+def setup_pi(args, run_id):
+    """Готовит доступ к живой Pi для прогона: читает креды из окружения и
+    подключается. Pi необязательна -- при --no-pi или недоступности возвращает
+    None, прогон продолжится на эмуляции. Печатает итоговый статус Pi."""
+    pi = None if args.no_pi else PiDevice.from_env(run_id)
+    if pi is not None:
+        try:
+            pi.connect()
+        except Exception as exc:
+            print(f"[!] Pi настроена, но недоступна: {exc}", file=sys.stderr)
+            print("    продолжаю без неё; проверить связь: python agent.py --check-pi",
+                  file=sys.stderr)
+            pi = None
+    print(f"[i] Pi         : {pi.host if pi else 'нет, только эмуляция'}")
+    return pi
+
+
+def write_summary(work, summary):
+    """Пишет summary.json прогона и печатает человекочитаемую сводку."""
+    (work / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("\n" + "=" * 60)
+    for k, v in summary.items():
+        print(f"  {k:<12} {v}")
+    print(f"  каталог      {work}")
+    if not summary["report"]:
+        print("  [!] report.md не написан -- модель не довела работу до конца")
+
+
 # ---------------------------------------------------------------------------
 def main():
     args = build_parser().parse_args()
@@ -1099,23 +1150,8 @@ def main():
               f"этой моделью, иду litellm", file=sys.stderr)
 
     if not want_sub:
-        # litellm-маршрут: нужна модель и ключ. Проверяем до запуска контейнера.
-        if not args.model:
-            sys.exit("для litellm-маршрута нужен --model (litellm_model)")
-        import litellm
-        # LiteLLM печатает баннеры в stderr мимо исключений -- отключаем.
-        litellm.suppress_debug_info = True
-        try:
-            if not litellm.supports_function_calling(model=args.model):
-                print(f"[!] LiteLLM не подтверждает поддержку инструментов у {args.model}.",
-                      file=sys.stderr)
-        except Exception:
-            pass
-        env = litellm.validate_environment(model=args.model)
-        if not env.get("keys_in_environment"):
-            missing = " или ".join(env.get("missing_keys") or ["?"])
-            sys.exit(f"не задан ключ для {args.model}: нужна переменная {missing}\n"
-                     f"впишите её в .env (образец -- .env.example)")
+        # litellm-маршрут: модель и ключ нужны до запуска контейнера.
+        preflight_litellm(args.model)
 
     label_src = args.model or args.subscription_model or args.model_name or "model"
     label = label_src.replace("/", "_").replace(":", "_")
@@ -1149,16 +1185,7 @@ def main():
     print(f"[i] каталог    : {work}")
 
     # Pi необязательна, нужна обоим маршрутам (креды/доступ к живой Pi).
-    pi = None if args.no_pi else PiDevice.from_env(run_id)
-    if pi is not None:
-        try:
-            pi.connect()
-        except Exception as exc:
-            print(f"[!] Pi настроена, но недоступна: {exc}", file=sys.stderr)
-            print("    продолжаю без неё; проверить связь: python agent.py --check-pi",
-                  file=sys.stderr)
-            pi = None
-    print(f"[i] Pi         : {pi.host if pi else 'нет, только эмуляция'}")
+    pi = setup_pi(args, run_id)
 
     if want_sub:
         # subscription-маршрут: своего контейнера (claude -p) достаточно, Sandbox не нужен.
@@ -1220,15 +1247,7 @@ def main():
         summary["findings"] = sum(1 for _ in (work / "findings.jsonl").open(encoding="utf-8"))
         summary["report"] = (work / "report.md").is_file()
 
-    (work / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    print("\n" + "=" * 60)
-    for k, v in summary.items():
-        print(f"  {k:<12} {v}")
-    print(f"  каталог      {work}")
-    if not summary["report"]:
-        print("  [!] report.md не написан -- модель не довела работу до конца")
+    write_summary(work, summary)
 
 
 if __name__ == "__main__":
