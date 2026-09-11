@@ -186,6 +186,11 @@ def main():
             print(f"      находок {summary.get('findings', '?')}, отчёт {report}, "
                   f"шагов {summary.get('turns', '?')}, ${summary.get('usd', '?')}, "
                   f"кэш {summary.get('cache_hit_rate', '?')}")
+            # Причину видно всегда, когда модель ничего не дала -- напр. протухший
+            # токен подписки (её формирует сама модель в summary, мы лишь печатаем).
+            sr = summary.get("stop_reason", "")
+            if not summary.get("findings") and not summary.get("report") and sr:
+                print(f"      причина: {sr}")
 
     manifest["finished"] = datetime.now().isoformat(timespec="seconds")
     manifest["wall_seconds"] = round(time.time() - t0)
