@@ -885,6 +885,13 @@ class ClaudeModel(BaseModel):
             "--output-format", "json",
             "--dangerously-skip-permissions",
         ]
+        # Лимит на прогon: claude Code сам остановится при достижении этого
+        # API-эквивалента, НЕ дожидаясь исчерпания 5-часового окна подписки.
+        # Расход растёт ~квадратично с числом шагов (каждый шаг тащит всю
+        # накопленную историю), поэтому без лимита автономный claude легко
+        # выбирает всё окно. С записью-по-ходу к моменту стопа отчёт уже полон.
+        if max_usd and max_usd > 0:
+            cmd += ["--max-budget-usd", str(max_usd)]
 
         print(f"[i] {model_id}: subscription-маршрут (claude -p в контейнере), "
               f"токен ~{left:.1f} ч, Pi={'да' if pi else 'нет'}", flush=True)

@@ -101,9 +101,13 @@ def main():
                     default="litellm",
                     help="предпочтительный маршрут для всех моделей (кто умеет)")
     ap.add_argument("--budget-total", type=float, default=10.0,
-                    help="общий бюджet в $ на весь прогон, делится поровну между моделями")
+                    help="общий бюджет в $ (реальные деньги) на litellm-модели, делится "
+                         "поровну между НИМИ; subscription-модели в делении не участвуют")
     ap.add_argument("--budget-per-model", type=float, default=None,
-                    help="бюджет на модель (переопределяет деление budget-total)")
+                    help="бюджет на litellm-модель (переопределяет деление budget-total)")
+    ap.add_argument("--budget-claude-subscription", type=float, default=10.0,
+                    help="лимит (API-эквивалент) для Claude по подписке -> --max-budget-usd. "
+                         "Не реальные деньги: расход из лимитов Pro. ~75%% окна Opus ≈ 10")
     ap.add_argument("--max-turns", type=int, default=80)
     ap.add_argument("--parallel", type=int, default=3,
                     help="сколько моделей гнать одновременно (docker и API не любят перегруз)")
@@ -124,7 +128,28 @@ def main():
     descs = [parse_model_desc(s) for s in specs]
     models = [d["id"] for d in descs]
 
-    per_model = args.budget_per_model or round(args.budget_total / len(descs), 3)
+    # Маршрут модели (для деления бюджета): subscription, если так предпочтено и
+    # модель это умеет. Токен-свежесть тут не важна -- это про деление денег.
+    def is_subscription(d):
+        return (args.preferred_models_run_type == "subscription"
+                and bool(d.get("subscription_model")))
+
+    # budget-total (реальные деньги) делится только между LITELLM-моделями:
+    # подписка реальных денег не тратит и бюджет у litellm не отбирает.
+    litellm_descs = [d for d in descs if not is_subscription(d)]
+    if litellm_descs:
+        per_litellm = args.budget_per_model or round(args.budget_total / len(litellm_descs), 3)
+    else:
+        # Только подписочные модели -- делить budget-total не между кем.
+        per_litellm = args.budget_per_model or 0.0
+
+    def budget_for(d):
+        if is_subscription(d):
+            # Каждой подписочной модели -- свой лимит (у них разные окна/валюты).
+            if d.get("name") == "claude":
+                return args.budget_claude_subscription
+            return per_litellm  # неизвестная подписочная модель -- запасной вариант
+        return per_litellm
 
     run_id = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     run_dir = Path(args.run_dir).resolve() if args.run_dir else HERE / "runs" / f"ens_{run_id}"
@@ -146,8 +171,11 @@ def main():
     print(f"[i] бинарь     : {sample.name}")
     print(f"[i] моделей    : {len(descs)}, параллельно {args.parallel}")
     print(f"[i] маршрут    : предпочтительно {args.preferred_models_run_type}")
-    print(f"[i] бюджет     : ${per_model} на модель, ${round(per_model * len(descs), 2)} всего")
-    print(f"[i] модели     : {', '.join(models)}\n")
+    for d in descs:
+        route = "subscription" if is_subscription(d) else "litellm"
+        kind = "лимит-подписки" if is_subscription(d) else "реальные $"
+        print(f"[i]   {d['id'][:40]:<40} {route:<13} бюджет ${budget_for(d)} ({kind})")
+    print()
 
     # Манифест пишем сразу, чтобы при обрыве было видно, что запускалось.
     manifest = {
@@ -157,7 +185,8 @@ def main():
         "sample_bytes": sample.stat().st_size,
         "models": models,
         "preferred_run_type": args.preferred_models_run_type,
-        "budget_per_model": per_model,
+        "budget_per_litellm": per_litellm,
+        "budget_claude_subscription": args.budget_claude_subscription,
         "max_turns": args.max_turns,
         "started": datetime.now().isoformat(timespec="seconds"),
         "results": {},
@@ -169,7 +198,7 @@ def main():
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
         futures = {
-            pool.submit(run_one, d, sample, run_dir, per_model, args.max_turns,
+            pool.submit(run_one, d, sample, run_dir, budget_for(d), args.max_turns,
                         args.preferred_models_run_type, extra,
                         run_dir / f"{label_for(d)}.console.log"): d["id"]
             for d in descs
