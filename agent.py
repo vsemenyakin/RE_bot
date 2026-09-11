@@ -1155,6 +1155,74 @@ def write_summary(work, summary):
         print("  [!] report.md не написан -- модель не довела работу до конца")
 
 
+def run_subscription_route(args, model_obj, work, dep_names, pi):
+    """subscription-маршрут: своего контейнера (claude -p) достаточно, Sandbox не
+    нужен. run_subscribed сам формирует полный summary (attack/findings/report/pi).
+    Закрывает Pi в любом исходе. Возвращает summary."""
+    try:
+        return model_obj.run(
+            preferred_run_type="subscription",
+            work=work, task=args.task, system_prompt=SYSTEM_PROMPT,
+            image=args.image, deps=dep_names, pi=pi, max_usd=args.max_usd)
+    except KeyboardInterrupt:
+        return {"model": args.subscription_model, "stop_reason": "прервано пользователем"}
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return {"model": args.subscription_model,
+                "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
+    finally:
+        if pi is not None:
+            pi.close()
+
+
+def run_litellm_route(args, model_obj, work, label, dep_names, pi):
+    """litellm-маршрут: поднимает Sandbox-контейнер, гоняет модель, закрывает
+    контейнер и Pi. run_agent даёт частичный summary -- достраиваем его
+    (pi/attack-fingerprint/findings/report). Возвращает summary."""
+    sandbox = Sandbox(
+        image=args.image, workdir=work,
+        name=f"re-{label[:30]}-{uuid.uuid4().hex[:6]}", agent_label=args.model,
+    )
+    sandbox.start()
+    print(f"[i] контейнер  : {sandbox.name}")
+    try:
+        summary = model_obj.run(
+            preferred_run_type="litellm",
+            model=args.model, task=args.task, sandbox=sandbox, log_dir=work,
+            max_turns=args.max_turns, max_usd=args.max_usd, cmd_timeout=args.cmd_timeout,
+            max_tokens=args.max_tokens, max_retries=args.max_retries,
+            retry_delay=args.retry_delay, pi=pi, wrap_at=args.wrap_at,
+            use_cache=not args.no_cache, deps=dep_names)
+    except KeyboardInterrupt:
+        summary = {"model": args.model, "stop_reason": "прервано пользователем"}
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        summary = {"model": args.model,
+                   "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
+    finally:
+        sandbox.stop(keep=args.keep_container)
+        if pi is not None:
+            pi.close()
+    # litellm-путь: run_agent даёт частичный summary, дополняем его.
+    summary["pi"] = f"{pi.user}@{pi.host}" if pi else None
+    import hashlib
+    def _sha(s):
+        return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
+    summary["attack"] = {
+        "profile": "litellm",
+        "prompt_sha": _sha(SYSTEM_PROMPT),
+        "task_sha": _sha(args.task),
+        "max_turns": args.max_turns,
+        "max_usd": args.max_usd,
+        "pi_available": pi is not None,
+    }
+    summary["findings"] = sum(1 for _ in (work / "findings.jsonl").open(encoding="utf-8"))
+    summary["report"] = (work / "report.md").is_file()
+    return summary
+
+
 # ---------------------------------------------------------------------------
 def main():
     args = build_parser().parse_args()
@@ -1200,64 +1268,9 @@ def main():
     pi = setup_pi(args, run_id)
 
     if want_sub:
-        # subscription-маршрут: своего контейнера (claude -p) достаточно, Sandbox не нужен.
-        # run_subscribed сам формирует полный summary (attack/findings/report/pi).
-        try:
-            summary = model_obj.run(
-                preferred_run_type="subscription",
-                work=work, task=args.task, system_prompt=SYSTEM_PROMPT,
-                image=args.image, deps=dep_names, pi=pi, max_usd=args.max_usd)
-        except KeyboardInterrupt:
-            summary = {"model": args.subscription_model, "stop_reason": "прервано пользователем"}
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            summary = {"model": args.subscription_model,
-                       "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
-        finally:
-            if pi is not None:
-                pi.close()
+        summary = run_subscription_route(args, model_obj, work, dep_names, pi)
     else:
-        sandbox = Sandbox(
-            image=args.image, workdir=work,
-            name=f"re-{label[:30]}-{uuid.uuid4().hex[:6]}", agent_label=args.model,
-        )
-        sandbox.start()
-        print(f"[i] контейнер  : {sandbox.name}")
-        try:
-            summary = model_obj.run(
-                preferred_run_type="litellm",
-                model=args.model, task=args.task, sandbox=sandbox, log_dir=work,
-                max_turns=args.max_turns, max_usd=args.max_usd, cmd_timeout=args.cmd_timeout,
-                max_tokens=args.max_tokens, max_retries=args.max_retries,
-                retry_delay=args.retry_delay, pi=pi, wrap_at=args.wrap_at,
-                use_cache=not args.no_cache, deps=dep_names)
-        except KeyboardInterrupt:
-            summary = {"model": args.model, "stop_reason": "прервано пользователем"}
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            summary = {"model": args.model,
-                       "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
-        finally:
-            sandbox.stop(keep=args.keep_container)
-            if pi is not None:
-                pi.close()
-        # litellm-путь: run_agent даёт частичный summary, дополняем его.
-        summary["pi"] = f"{pi.user}@{pi.host}" if pi else None
-        import hashlib
-        def _sha(s):
-            return hashlib.sha256(str(s).encode("utf-8")).hexdigest()[:12]
-        summary["attack"] = {
-            "profile": "litellm",
-            "prompt_sha": _sha(SYSTEM_PROMPT),
-            "task_sha": _sha(args.task),
-            "max_turns": args.max_turns,
-            "max_usd": args.max_usd,
-            "pi_available": pi is not None,
-        }
-        summary["findings"] = sum(1 for _ in (work / "findings.jsonl").open(encoding="utf-8"))
-        summary["report"] = (work / "report.md").is_file()
+        summary = run_litellm_route(args, model_obj, work, label, dep_names, pi)
 
     write_summary(work, summary)
 
