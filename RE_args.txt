@@ -11,21 +11,7 @@ deps = samples/libonnxruntime.so samples/vehicle.onnx samples/scene.krw
 
 # Модели через запятую: пути к файлам описания (models/claude.txt и т.п.).
 # Можно и прямые litellm-имена (openrouter/...) -- тогда только litellm.
-models = models/claude.txt,models/grok.txt
-
-# Предпочтительный маршрут запуска:
-#   litellm      -- все модели через OpenRouter (тратит кредиты, стабильно)
-#   subscription -- кто умеет (Claude), идёт через подписку Pro (claude -p,
-#                   дешевле); кто не умеет (Grok) -- через litellm.
-# Требует свежий токен: claude auth login. Только для ДОВЕРЕННОГО бинаря
-# (контейнер Claude идёт с сетью и доступом к Pi).
-preferred_models_run_type = subscription
-
-# Общий бюджет в $, делится поровну. Для subscription-моделей бюджет в деньгах
-# не тратится (идёт из лимитов подписки), но для litellm-моделей (Grok) -- да.
-budget-total = 3
-
-budget-claude-subscription = 10
+models = models/claude.txt
 
 # Метка версии бинаря -- по ней судья сравнивает регрессии между версиями.
 label = kerbside-0.1.0

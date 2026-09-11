@@ -87,8 +87,8 @@ def main():
         sys.exit(f"нет файла целей: {targets_out} -- убери --skip-targets или создай его")
 
     # === ЭТАП 2: атака ансамблем ===
-    # Имена ключей в файле аргументов -- с подчёркиванием (preferred_models_run_type),
-    # флаги orchestrate -- с дефисом. Нормализуем: '_' -> '-' только в имени ключа.
+    # Имена ключей в файле аргументов бывают с подчёркиванием, флаги orchestrate --
+    # с дефисом. Нормализуем: '_' -> '-' только в имени ключа (не в значении).
     cmd = [py, str(HERE / "orchestrate.py"), "--run-dir", str(run_dir)]
     for key, val in conf.items():
         if key in JUDGE_KEYS:

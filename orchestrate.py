@@ -31,14 +31,22 @@ HERE = Path(__file__).resolve().parent
 
 
 def parse_model_desc(spec):
-    """Спецификация модели -> dict {name, litellm_model, subscription_model, id}.
+    """Спецификация модели -> dict со всеми её настройками.
 
     spec -- путь к файлу описания (models/claude.txt) ИЛИ прямое имя litellm-модели
     (обратная совместимость: openrouter/... трактуется как только-litellm).
+
+    Настройки маршрутов симметричны: пара *_model + *_budget на каждый маршрут.
+      name, litellm_model, litellm_budget,
+      subscription_model, subscription_budget,
+      preferred_run_type ('litellm' по умолчанию, если не задан).
     """
+    base = {"name": "", "litellm_model": "", "litellm_budget": "",
+            "subscription_model": "", "subscription_budget": "",
+            "preferred_run_type": "litellm"}
     p = Path(spec)
     if p.is_file():
-        d = {"name": "", "litellm_model": "", "subscription_model": ""}
+        d = dict(base)
         for line in p.read_text(encoding="utf-8").splitlines():
             line = line.split("#", 1)[0].strip()
             if "=" not in line:
@@ -47,7 +55,10 @@ def parse_model_desc(spec):
             d[k.strip()] = v.strip().strip('"').strip("'")
         d["id"] = d.get("litellm_model") or d.get("subscription_model") or d.get("name") or spec
         return d
-    return {"name": "", "litellm_model": spec, "subscription_model": "", "id": spec}
+    d = dict(base)
+    d["litellm_model"] = spec
+    d["id"] = spec
+    return d
 
 
 def label_for(desc):
@@ -97,17 +108,8 @@ def main():
     ap.add_argument("--models", required=True,
                     help="через запятую: пути к файлам описания моделей (models/claude.txt) "
                          "или прямые имена litellm-моделей")
-    ap.add_argument("--preferred-models-run-type", choices=["litellm", "subscription"],
-                    default="litellm",
-                    help="предпочтительный маршрут для всех моделей (кто умеет)")
-    ap.add_argument("--budget-total", type=float, default=10.0,
-                    help="общий бюджет в $ (реальные деньги) на litellm-модели, делится "
-                         "поровну между НИМИ; subscription-модели в делении не участвуют")
-    ap.add_argument("--budget-per-model", type=float, default=None,
-                    help="бюджет на litellm-модель (переопределяет деление budget-total)")
-    ap.add_argument("--budget-claude-subscription", type=float, default=10.0,
-                    help="лимит (API-эквивалент) для Claude по подписке -> --max-budget-usd. "
-                         "Не реальные деньги: расход из лимитов Pro. ~75%% окна Opus ≈ 10")
+    # Маршрут и бюджет настраиваются per-model в файлах описания
+    # (preferred_run_type, litellm_budget, subscription_budget)
     ap.add_argument("--max-turns", type=int, default=80)
     ap.add_argument("--parallel", type=int, default=3,
                     help="сколько моделей гнать одновременно (docker и API не любят перегруз)")
@@ -128,28 +130,27 @@ def main():
     descs = [parse_model_desc(s) for s in specs]
     models = [d["id"] for d in descs]
 
-    # Маршрут модели (для деления бюджета): subscription, если так предпочтено и
-    # модель это умеет. Токен-свежесть тут не важна -- это про деление денег.
-    def is_subscription(d):
-        return (args.preferred_models_run_type == "subscription"
-                and bool(d.get("subscription_model")))
+    # Маршрут модели: subscription, если так предпочтено В ЕЁ ФАЙЛЕ и модель это
+    # умеет (есть subscription_model). preferred=subscription без subscription_model
+    # -> тихо litellm (предупредит сам agent.py).
+    def route_of(d):
+        if d.get("preferred_run_type") == "subscription" and d.get("subscription_model"):
+            return "subscription"
+        return "litellm"
 
-    # budget-total (реальные деньги) делится только между LITELLM-моделями:
-    # подписка реальных денег не тратит и бюджет у litellm не отбирает.
-    litellm_descs = [d for d in descs if not is_subscription(d)]
-    if litellm_descs:
-        per_litellm = args.budget_per_model or round(args.budget_total / len(litellm_descs), 3)
-    else:
-        # Только подписочные модели -- делить budget-total не между кем.
-        per_litellm = args.budget_per_model or 0.0
-
-    def budget_for(d):
-        if is_subscription(d):
-            # Каждой подписочной модели -- свой лимит (у них разные окна/валюты).
-            if d.get("name") == "claude":
-                return args.budget_claude_subscription
-            return per_litellm  # неизвестная подписочная модель -- запасной вариант
-        return per_litellm
+    # Бюджет модели -- из её файла, по активному маршруту. Не задан -> явная ошибка
+    # (бюджет слишком важен, особенно litellm -- это реальные деньги).
+    def budget_of(d):
+        route = route_of(d)
+        key = "subscription_budget" if route == "subscription" else "litellm_budget"
+        raw = d.get(key, "")
+        if raw == "" or raw is None:
+            sys.exit(f"[!] у модели {d['id']} не задан {key} для маршрута {route}. "
+                     f"Укажи его в файле описания.")
+        try:
+            return float(raw)
+        except ValueError:
+            sys.exit(f"[!] {key} у модели {d['id']} не число: {raw!r}")
 
     run_id = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     run_dir = Path(args.run_dir).resolve() if args.run_dir else HERE / "runs" / f"ens_{run_id}"
@@ -170,11 +171,12 @@ def main():
     print(f"[i] прогон     : {run_dir.name}")
     print(f"[i] бинарь     : {sample.name}")
     print(f"[i] моделей    : {len(descs)}, параллельно {args.parallel}")
-    print(f"[i] маршрут    : предпочтительно {args.preferred_models_run_type}")
+    routes = {}
     for d in descs:
-        route = "subscription" if is_subscription(d) else "litellm"
-        kind = "лимит-подписки" if is_subscription(d) else "реальные $"
-        print(f"[i]   {d['id'][:40]:<40} {route:<13} бюджет ${budget_for(d)} ({kind})")
+        route = route_of(d)
+        routes[d["id"]] = {"route": route, "budget": budget_of(d)}
+        kind = "лимит-подписки" if route == "subscription" else "реальные $"
+        print(f"[i]   {d['id'][:40]:<40} {route:<13} бюджет ${budget_of(d)} ({kind})")
     print()
 
     # Манифест пишем сразу, чтобы при обрыве было видно, что запускалось.
@@ -184,9 +186,7 @@ def main():
         "sample": sample.name,
         "sample_bytes": sample.stat().st_size,
         "models": models,
-        "preferred_run_type": args.preferred_models_run_type,
-        "budget_per_litellm": per_litellm,
-        "budget_claude_subscription": args.budget_claude_subscription,
+        "routes": routes,
         "max_turns": args.max_turns,
         "started": datetime.now().isoformat(timespec="seconds"),
         "results": {},
@@ -198,8 +198,8 @@ def main():
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
         futures = {
-            pool.submit(run_one, d, sample, run_dir, budget_for(d), args.max_turns,
-                        args.preferred_models_run_type, extra,
+            pool.submit(run_one, d, sample, run_dir, budget_of(d), args.max_turns,
+                        route_of(d), extra,
                         run_dir / f"{label_for(d)}.console.log"): d["id"]
             for d in descs
         }
