@@ -875,9 +875,14 @@ class ClaudeModel(BaseModel):
         return self.run_litellm(**run_args)
 
     def run_subscribed(self, work, task, system_prompt, image="re-workbench:latest",
-                       deps=(), pi=None, max_usd=None, cred_path=CLAUDE_CRED_PATH,
-                       **ignore):
-        """Запуск claude -p в контейнере через подписку. Возвращает summary-словарь."""
+                       deps=(), pi=None, max_usd=None, autocompact=100_000,
+                       cred_path=CLAUDE_CRED_PATH, **ignore):
+        """Запуск claude -p в контейнере через подписку. Возвращает summary-словарь.
+
+        autocompact -- порог авто-сжатия контекста в токенах (диапазон CLI
+        100k..1M). Держит рабочее окно ограниченным и ломает квадратичный рост
+        расхода до ~линейного. None/0 -> флаг не передаём, claude берёт свой
+        дефолт (auto)."""
         import time
         t0 = time.time()
         model_id = self.params.get("subscription_model")
@@ -921,16 +926,26 @@ class ClaudeModel(BaseModel):
             "--output-format", "json",
             "--dangerously-skip-permissions",
         ]
-        # Лимит на прогon: claude Code сам остановится при достижении этого
-        # API-эквивалента, НЕ дожидаясь исчерпания 5-часового окна подписки.
-        # Расход растёт ~квадратично с числом шагов (каждый шаг тащит всю
-        # накопленную историю), поэтому без лимита автономный claude легко
-        # выбирает всё окно. С записью-по-ходу к моменту стопа отчёт уже полон.
+        # Потолок СУММЫ: claude Code остановится при достижении этого API-
+        # эквивалента, не дожидаясь исчерпания 5-часового окна подписки. Меняет
+        # только потолок, но не форму кривой расхода.
         if max_usd and max_usd > 0:
             cmd += ["--max-budget-usd", str(max_usd)]
+        # Форма кривой: без сжатия расход растёт ~квадратично (каждый шаг тащит
+        # всю накопленную историю: шаг N несёт ~N*c, сумма ~c*N^2/2). autocompact
+        # держит контекст в пределах порога -- старые ходы сжимаются в резюме,
+        # каждый шаг несёт <= порога, и сумма становится ~линейной. Терять из
+        # контекста нечего: находки уже на диске (re-note/report.md по ходу).
+        if autocompact and autocompact > 0:
+            ac = max(100_000, min(1_000_000, int(autocompact)))
+            if ac != int(autocompact):
+                print(f"[i] autocompact {autocompact} вне 100k..1M, взял {ac}",
+                      file=sys.stderr)
+            cmd += ["--autocompact", str(ac)]
 
+        ac_note = f"autocompact {int(autocompact)//1000}k" if autocompact else "autocompact off"
         print(f"[i] {model_id}: subscription-маршрут (claude -p в контейнере), "
-              f"токен ~{left:.1f} ч, Pi={'да' if pi else 'нет'}", flush=True)
+              f"токен ~{left:.1f} ч, Pi={'да' if pi else 'нет'}, {ac_note}", flush=True)
 
         transcript = (work / "transcript.jsonl").open("w", encoding="utf-8")
         transcript.write(json.dumps({"kind": "subscribed_start", "model": model_id,
