@@ -236,30 +236,62 @@ def score(targets, verdicts):
 
 
 def attack_fingerprint(reports):
-    """Отпечаток силы атаки: набор моделей и их конфигурация.
+    """Отпечаток силы атаки: набор ЭФФЕКТИВНЫХ атакующих и их конфигурация.
 
     Стойкость двух ВЕРСИЙ бинаря сравнима только при ОДИНАКОВОЙ атаке. Разные
     модели, промпт, бюджет или доступность Pi -- другая атака, и разница в балле
     отражает силу атаки, а не защищённость. Отпечаток отсекает такие сравнения.
+
+    В отпечаток идут только модели, которые РЕАЛЬНО что-то дали (отчёт или
+    находки) -- эффективный ансамбль, а не просто список сконфигурированных.
+    Иначе прогон, где отработал только claude, сравнивался бы с прогоном, где
+    отработал только grok (модель, что "пришла, но ничего не дала", участником
+    не считается). Возвращаем этот же эффективный набор как список моделей.
     """
     import hashlib
     parts = []
+    effective = []
     for model, data in sorted(reports.items()):
+        if not (data.get("report") or data.get("findings")):
+            continue
+        effective.append(model)
         a = data["summary"].get("attack", {})
         parts.append("|".join(str(x) for x in [
             model, a.get("prompt_sha", "?"), a.get("task_sha", "?"),
             a.get("max_turns", "?"), a.get("max_usd", "?"), a.get("pi_available", "?"),
         ]))
     blob = "\n".join(parts)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12], sorted(reports)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12], effective
+
+
+def run_is_valid(resilience_data, run_path):
+    """Годится ли прошлый замер в базу сравнения.
+
+    Только если атака РЕАЛЬНО состоялась -- хоть один атакующий дал отчёт или
+    находки. Пустой/упавший прогон (0 находок, нет отчёта) тривиально получает
+    стойкость 1.0 и, попав в базу, породил бы ложную "регрессию" при первом же
+    настоящем замере. Новые замеры несут это в поле attack_ok; для старых без
+    поля доопределяем по каталогу прогона, если он ещё на месте (иначе считаем
+    невалидным -- проверить нельзя).
+    """
+    if "attack_ok" in resilience_data:
+        return bool(resilience_data["attack_ok"])
+    if run_path.is_dir():
+        try:
+            reps = collect_attacker_reports(run_path)
+            return any(r["report"] or r["findings"] for r in reps.values())
+        except Exception:
+            return False
+    return False
 
 
 def find_previous(run_dir, binary_name, fingerprint):
-    """Ищет прошлые замеры того же бинаря, разделяя их по сопоставимости.
+    """Ищет прошлые ВАЛИДНЫЕ замеры того же бинаря, разделяя их по сопоставимости.
 
     Возвращает (comparable, incomparable):
       comparable   -- замеры С ТЕМ ЖЕ отпечатком атаки (дельту считать можно);
       incomparable -- замеры с другим отпечатком (разной атакой -- дельту нельзя).
+    Провальные прогоны (см. run_is_valid) отбрасываются из обоих списков.
     """
     comparable, incomparable = [], []
     for f in sorted(RUNS.glob("*/resilience.json")):
@@ -270,6 +302,8 @@ def find_previous(run_dir, binary_name, fingerprint):
         except Exception:
             continue
         if d.get("binary") != binary_name:
+            continue
+        if not run_is_valid(d, f.parent):
             continue
         if d.get("attack_fingerprint") == fingerprint:
             comparable.append(d)
@@ -339,6 +373,10 @@ def main():
     resilience, rows = score(targets, verdicts)
     fingerprint, attack_models = attack_fingerprint(reports)
 
+    # Состоялась ли атака: хоть один атакующий дал отчёт или находки. Если нет --
+    # балл стойкости тривиально высок (вскрывать было некому) и НЕ отражает защиту.
+    attack_ok = any(data["report"] or data["findings"] for data in reports.values())
+
     result = {
         "binary": binary_name,
         "version": version,
@@ -347,14 +385,18 @@ def main():
         "judge_model": args.judge,
         "judge_cost_usd": round(cost, 4) if cost else None,
         "attackers": list(reports),
+        "attack_ok": attack_ok,
         "attack_fingerprint": fingerprint,
         "attack_models": attack_models,
         "resilience": resilience,
         "targets": rows,
     }
 
-    # Дельта -- только между сопоставимыми замерами (одинаковая атака).
-    comparable, incomparable = find_previous(run_dir, binary_name, fingerprint)
+    # Дельта -- только для СОСТОЯВШЕЙСЯ атаки и только между сопоставимыми
+    # замерами (одинаковая атака). Провальный текущий прогон ни с чем не сравниваем.
+    comparable, incomparable = ([], [])
+    if attack_ok:
+        comparable, incomparable = find_previous(run_dir, binary_name, fingerprint)
     comparable = [d for d in comparable if d.get("resilience") is not None]
     if comparable and resilience is not None:
         prev = comparable[-1]  # самый свежий сопоставимый
@@ -373,6 +415,10 @@ def main():
     print("\n" + "=" * 62)
     print(f"  СТОЙКОСТЬ: {resilience}   (1.0 = ничего не вскрыто, 0.0 = вскрыто всё)")
     print("=" * 62)
+    if not attack_ok:
+        print("  [!] НИ ОДИН атакующий не дал отчёт/находок -- атака не состоялась.")
+        print("      Балл высок формально (вскрывать было некому), это НЕ замер")
+        print("      стойкости. В базу сравнения прогон не пойдёт.")
     mark = {"revealed": "ВСКРЫТО    ", "partial": "частично   ", "not_revealed": "устояло    "}
     for r in rows:
         by = (", ".join(r["by"]) or "-") if r["level"] != "not_revealed" else "-"

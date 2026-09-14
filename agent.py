@@ -1013,7 +1013,18 @@ class ClaudeModel(BaseModel):
             turns = d.get("num_turns")
             cost = d.get("total_cost_usd")
             if d.get("is_error"):
-                stop_reason = "claude ошибка: " + str(d.get("result", ""))[:200]
+                # Остановка по --max-budget-usd приходит как is_error, но это НЕ
+                # сбой: находки/отчёт уже на диске (пишем по ходу). Отличаем её от
+                # настоящей ошибки -- по тексту/подтипу или по расходу у потолка.
+                res_txt = str(d.get("result", ""))
+                subtype = str(d.get("subtype", ""))
+                near_budget = bool(max_usd) and isinstance(cost, (int, float)) \
+                    and cost >= max_usd * 0.95
+                if "budget" in (res_txt + subtype).lower() or near_budget:
+                    stop_reason = f"остановлено по бюджету (${cost} из ${max_usd})"
+                else:
+                    stop_reason = "claude ошибка: " + (res_txt[:200] or subtype
+                                                       or "(без описания)")
             else:
                 stop_reason = "claude завершил"
         except Exception:
@@ -1032,8 +1043,10 @@ class ClaudeModel(BaseModel):
             "seconds": round(time.time() - t0),
             "stop_reason": stop_reason,
             "pi": f"{pi.user}@{pi.host}" if pi else None,
+            # max_usd (бюджет) -- часть отпечатка: прогоны на $1 и $10 по-разному
+            # глубоки, судья не должен считать их сопоставимыми (симметрично litellm).
             "attack": attack_fingerprint("subscription-claude", system_prompt, task, pi,
-                                         subscription_model=model_id),
+                                         subscription_model=model_id, max_usd=max_usd),
             "findings": findings,
             "report": (work / "report.md").is_file(),
         }
