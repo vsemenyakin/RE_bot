@@ -947,6 +947,9 @@ class ClaudeModel(BaseModel):
                     f"{Path(cred_path).resolve()}:/home/reuser/.claude/.credentials.json"]
         cmd += [
             "-v", f"{work.resolve()}:/work",
+            "-w", "/work",  # cwd = /work, как в litellm-песочнице: относительные
+                            # пути (в т.ч. report.md) ложатся в примонтированный
+                            # каталог, а не теряются в HOME на --rm.
             "-e", "RE_AGENT=subscription-claude",
         ]
         # Pi-креды пробрасываем внутрь, чтобы pi-exec из контейнера достучался до Pi.
@@ -1031,10 +1034,38 @@ class ClaudeModel(BaseModel):
             if proc.returncode != 0:
                 stop_reason = "claude упал: " + (proc.stderr or raw)[:200]
 
-        findings = 0
         ff = work / "findings.jsonl"
+        items = []
         if ff.is_file():
-            findings = sum(1 for ln in ff.read_text(encoding="utf-8").splitlines() if ln.strip())
+            for ln in ff.read_text(encoding="utf-8").splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    items.append(json.loads(ln))
+                except Exception:
+                    items.append({"text": ln})  # неразобранную строку тоже учтём
+        findings = len(items)
+
+        # Фолбэк-отчёт: обрыв (бюджет/лимит) мог оставить нас без report.md, хотя
+        # находки писались по ходу через re-note. Собираем минимальный отчёт из
+        # них, чтобы у судьи всегда был прозаический срез, а прогон не выглядел
+        # пустым. Настоящий report.md, если он есть, не трогаем.
+        report_path = work / "report.md"
+        if not report_path.is_file() and items:
+            md = [f"# Отчёт (автосборка из находок)", "",
+                  f"_report.md не был записан ({stop_reason}); собран автоматически "
+                  f"из {len(items)} находок re-note._", "",
+                  "## Находки", ""]
+            for it in items:
+                conf, addr, text = it.get("confidence", "?"), it.get("addr", ""), it.get("text", "")
+                head = f"- [{conf}]" + (f" `{addr}`" if addr else "")
+                md.append(f"{head} {text}")
+                if it.get("evidence"):
+                    md.append(f"    - доказательство: {it['evidence']}")
+            report_path.write_text("\n".join(md) + "\n", encoding="utf-8")
+            print(f"[i] {model_id}: report.md не записан -> собрал фолбэк из "
+                  f"{len(items)} находок", flush=True)
 
         return {
             "model": model_id,
