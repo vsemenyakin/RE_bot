@@ -974,11 +974,13 @@ class ClaudeModel(BaseModel):
         # только потолок, но не форму кривой расхода.
         if max_usd and max_usd > 0:
             cmd += ["--max-budget-usd", str(max_usd)]
-        # Форма кривой: без сжатия расход растёт ~квадратично (каждый шаг тащит
-        # всю накопленную историю: шаг N несёт ~N*c, сумма ~c*N^2/2). autocompact
-        # держит контекст в пределах порога -- старые ходы сжимаются в резюме,
-        # каждый шаг несёт <= порога, и сумма становится ~линейной. Терять из
-        # контекста нечего: находки уже на диске (re-note/report.md по ходу).
+        # autocompact: страховка от разрастания контекста. НА ПРАКТИКЕ инертен
+        # (замер 2026-09-14): Claude Code сам держит контекст ограниченным -- на
+        # прогонах $1/22 шага и $3/59 шагов он упирался в ~73k токенов (в основном
+        # наш фиксированный преамбл), НЕ дорастая до порога 100k, а расход выходил
+        # линейным ($0.046 и $0.048 за шаг), без квадратичного роста. Порог ниже
+        # 73k не поставить (минимум CLI = 100k). Оставляем на случай очень длинных
+        # прогонов/огромных бинарей, где контекст всё же перевалит 100k.
         if autocompact and autocompact > 0:
             ac = max(100_000, min(1_000_000, int(autocompact)))
             if ac != int(autocompact):
@@ -1021,9 +1023,15 @@ class ClaudeModel(BaseModel):
                 # настоящей ошибки -- по тексту/подтипу или по расходу у потолка.
                 res_txt = str(d.get("result", ""))
                 subtype = str(d.get("subtype", ""))
+                low = (res_txt + " " + subtype).lower()
                 near_budget = bool(max_usd) and isinstance(cost, (int, float)) \
                     and cost >= max_usd * 0.95
-                if "budget" in (res_txt + subtype).lower() or near_budget:
+                if "session limit" in low or ("limit" in low and "reset" in low):
+                    # Исчерпано 5-часовое окно Pro -- НЕ ошибка и НЕ наш бюджет:
+                    # штатный предел подписки (напр. "resets 12:30pm (UTC)").
+                    stop_reason = ("остановлено: исчерпан лимит окна подписки -- "
+                                   + (res_txt[:150] or "окно сбросится позже"))
+                elif "budget" in low or near_budget:
                     stop_reason = f"остановлено по бюджету (${cost} из ${max_usd})"
                 else:
                     stop_reason = "claude ошибка: " + (res_txt[:200] or subtype
