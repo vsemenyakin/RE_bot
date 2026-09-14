@@ -841,16 +841,32 @@ kerbside даёт мусор. Не забудь LD_LIBRARY_PATH к катало�
 def token_expiry_hours(cred_path=CLAUDE_CRED_PATH):
     """Часов до истечения REFRESH-токена подписки; None если файла/поля нет.
 
-    Смотрим именно на refresh (~28 дней), а НЕ на access (~8 ч): пока refresh жив,
-    claude сам обновляет протухший access по нему, без браузера. Блокировать
-    прогон и требовать `claude auth login` нужно только когда мёртв refresh --
-    тогда без браузера токен не восстановить. Проверка по access отвергала бы
-    прогон каждые 8 ч, хотя claude мог обновиться сам.
+    Refresh (~28 дней) -- внешняя граница: мёртв он -> без браузерного
+    `claude auth login` токен не восстановить вообще. Живой refresh, однако, НЕ
+    гарантирует рабочий прогон: headless `claude -p` протухший access сам не
+    обновляет (баг anthropics/claude-code#50743), а программный refresh_token
+    grant для нашего аккаунта отвергается (429) -- проверено эмпирически. Поэтому
+    отдельно проверяем и access (см. access_expiry_hours).
     """
     try:
         import time
         d = json.loads(Path(cred_path).read_text(encoding="utf-8"))["claudeAiOauth"]
         return (d["refreshTokenExpiresAt"] / 1000 - time.time()) / 3600
+    except Exception:
+        return None
+
+
+def access_expiry_hours(cred_path=CLAUDE_CRED_PATH):
+    """Часов до истечения ACCESS-токена подписки (~8 ч); None если файла/поля нет.
+
+    Проверяем перед запуском: протух access -> claude -p упадёт внутри контейнера
+    с криптовым 401, а сам он его не обновит. Лучше отсечь заранее с понятной
+    инструкцией про `claude auth login`.
+    """
+    try:
+        import time
+        d = json.loads(Path(cred_path).read_text(encoding="utf-8"))["claudeAiOauth"]
+        return (d["expiresAt"] / 1000 - time.time()) / 3600
     except Exception:
         return None
 
@@ -888,8 +904,7 @@ class ClaudeModel(BaseModel):
         model_id = self.params.get("subscription_model")
         work = Path(work)
 
-        # Работоспособность токена по REFRESH (~28 дней): пока он жив, claude сам
-        # обновит протухший access. Мёртв refresh -> нужен браузерный login.
+        # Мёртв refresh (~28 дней) -> токен без браузера не восстановить.
         left = token_expiry_hours(cred_path)
         if left is None:
             return {"model": model_id, "stop_reason": "нет токена подписки: "
@@ -898,6 +913,14 @@ class ClaudeModel(BaseModel):
             return {"model": model_id, "stop_reason":
                     f"refresh-токен подписки истёк (~{left:.1f} ч) -- нужен браузерный "
                     f"claude auth login (это раз в ~28 дней)"}
+        # Протух access (~8 ч) -> claude -p сам его НЕ обновит (headless-баг
+        # #50743), а программный refresh даёт 429 -- отсекаем заранее с понятной
+        # инструкцией, иначе внутри контейнера будет криптовый 401.
+        acc = access_expiry_hours(cred_path)
+        if acc is not None and acc < 0.2:
+            return {"model": model_id, "stop_reason":
+                    f"access-токен подписки протух (~{acc:.1f} ч) -- сделай "
+                    f"claude auth login (access живёт ~8 ч, авто-обновления нет)"}
 
         # Полный промпт claude: наша методика + инструкция про Pi-обёртки этого режима.
         full_prompt = system_prompt + SUBSCRIPTION_PI_NOTE
