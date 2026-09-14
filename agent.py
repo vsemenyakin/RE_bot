@@ -1019,49 +1019,79 @@ class ClaudeModel(BaseModel):
         model_id = self.params.get("subscription_model")
         work = Path(work)
 
-        # Аутентификация подписки -- два пути:
-        #  1) CLAUDE_CODE_OAUTH_TOKEN (claude setup-token, ~1 год): статический
-        #     токен через env. Не истекает каждые 8 ч, рефреш не нужен, креды не
-        #     монтируем. Приоритетный, если задан.
-        #  2) .credentials.json (обычный claude auth login, access ~8 ч): фолбэк.
-        #     Access сам НЕ обновляется (headless-баг #50743), программный refresh
-        #     даёт 429 -- поэтому срок проверяем заранее, а не ловим 401 внутри.
-        oat = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-        if oat:
-            auth_note = "oauth-token (env, ~1 год)"
-        else:
-            left = token_expiry_hours(cred_path)
-            if left is None:
-                return {"model": model_id, "stop_reason": "нет токена подписки: "
-                        f"{cred_path} -- сделай claude auth login или задай "
-                        f"CLAUDE_CODE_OAUTH_TOKEN"}
-            if left < 0.2:
-                return {"model": model_id, "stop_reason":
-                        f"refresh-токен подписки истёк (~{left:.1f} ч) -- нужен браузерный "
-                        f"claude auth login (это раз в ~28 дней)"}
-            acc = access_expiry_hours(cred_path)
-            if acc is not None and acc < 0.2:
-                return {"model": model_id, "stop_reason":
-                        f"access-токен подписки протух (~{acc:.1f} ч) -- сделай "
-                        f"claude auth login (access живёт ~8 ч, авто-обновления нет)"}
-            auth_note = f"credentials.json (~{left:.1f} ч до refresh)"
+        auth_note, auth_args, err = self._subscription_auth(cred_path)
+        if err:
+            return {"model": model_id, "stop_reason": err}
 
         # Полный промпт claude: наша методика + инструкция про Pi-обёртки этого режима.
         full_prompt = system_prompt + SUBSCRIPTION_PI_NOTE
+        cmd = self._build_subscription_cmd(work, task, model_id, image, full_prompt,
+                                           pi, max_usd, autocompact, auth_args)
 
-        cmd = [
-            "docker", "run", "--rm",
-            "--user", "reuser", "-e", "HOME=/home/reuser",
-        ]
-        if oat:
-            # Пробрасываем токен БЕЗ значения -- docker берёт его из окружения
-            # процесса (main() уже сделал load_dotenv), секрет не попадает в argv.
-            cmd += ["-e", "CLAUDE_CODE_OAUTH_TOKEN"]
-        else:
-            cmd += ["-v",
-                    f"{Path(cred_path).resolve()}:/home/reuser/.claude/.credentials.json"]
+        ac_note = f"autocompact {int(autocompact)//1000}k" if autocompact else "autocompact off"
+        print(f"[i] {model_id}: subscription-маршрут (claude -p в контейнере), "
+              f"{auth_note}, Pi={'да' if pi else 'нет'}, {ac_note}", flush=True)
+
+        raw, proc, err = self._invoke_claude(cmd, work, model_id, task)
+        if err:
+            return {"model": model_id, "stop_reason": err}
+
+        turns, cost, stop_reason = self._parse_result(raw, proc, max_usd)
+        items = self._read_findings(work)
+        self._write_fallback_report(work, items, stop_reason, model_id)
+
+        return {
+            "model": model_id,
+            "turns": turns,
+            "usd": round(cost, 4) if isinstance(cost, (int, float)) else cost,
+            "seconds": round(time.time() - t0),
+            "stop_reason": stop_reason,
+            "pi": f"{pi.user}@{pi.host}" if pi else None,
+            # max_usd (бюджет) -- часть отпечатка: прогоны на $1 и $10 по-разному
+            # глубоки, судья не должен считать их сопоставимыми (симметрично litellm).
+            "attack": attack_fingerprint("subscription-claude", system_prompt, task, pi,
+                                         subscription_model=model_id, max_usd=max_usd),
+            "findings": len(items),
+            "report": (work / "report.md").is_file(),
+        }
+
+    def _subscription_auth(self, cred_path):
+        """Разрешает аутентификацию подписки. Возвращает (auth_note, docker_args,
+        err): docker_args -- аргументы docker для проброса токена/кредов; err --
+        строка stop_reason при проблеме (тогда note/args = None), иначе None.
+
+        Два пути:
+          1) CLAUDE_CODE_OAUTH_TOKEN (claude setup-token, ~1 год): статический
+             токен через env, приоритетный. Не истекает каждые 8 ч, креды не
+             монтируем. Пробрасываем БЕЗ значения -- docker берёт его из окружения
+             (main уже сделал load_dotenv), секрет не попадает в argv.
+          2) .credentials.json (обычный claude auth login, access ~8 ч): фолбэк.
+             Access сам НЕ обновляется (headless-баг #50743), программный refresh
+             даёт 429 -- поэтому срок проверяем заранее, а не ловим 401 внутри."""
+        if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+            return "oauth-token (env, ~1 год)", ["-e", "CLAUDE_CODE_OAUTH_TOKEN"], None
+        left = token_expiry_hours(cred_path)
+        if left is None:
+            return None, None, (f"нет токена подписки: {cred_path} -- сделай "
+                                f"claude auth login или задай CLAUDE_CODE_OAUTH_TOKEN")
+        if left < 0.2:
+            return None, None, (f"refresh-токен подписки истёк (~{left:.1f} ч) -- нужен "
+                                f"браузерный claude auth login (это раз в ~28 дней)")
+        acc = access_expiry_hours(cred_path)
+        if acc is not None and acc < 0.2:
+            return None, None, (f"access-токен подписки протух (~{acc:.1f} ч) -- сделай "
+                                f"claude auth login (access живёт ~8 ч, авто-обновления нет)")
+        mount = ["-v", f"{Path(cred_path).resolve()}:/home/reuser/.claude/.credentials.json"]
+        return f"credentials.json (~{left:.1f} ч до refresh)", mount, None
+
+    def _build_subscription_cmd(self, work, task, model_id, image, full_prompt, pi,
+                                max_usd, autocompact, auth_args):
+        """Собирает docker-команду claude -p: база + аутентификация (auth_args) +
+        монтирование /work + Pi-env + флаги claude (бюджет, autocompact)."""
+        cmd = ["docker", "run", "--rm", "--user", "reuser", "-e", "HOME=/home/reuser"]
+        cmd += auth_args
         cmd += [
-            "-v", f"{work.resolve()}:/work",
+            "-v", f"{Path(work).resolve()}:/work",
             "-w", "/work",  # cwd = /work, как в litellm-песочнице: относительные
                             # пути (в т.ч. report.md) ложатся в примонтированный
                             # каталог, а не теряются в HOME на --rm.
@@ -1102,11 +1132,12 @@ class ClaudeModel(BaseModel):
                 print(f"[i] autocompact {autocompact} вне 100k..1M, взял {ac}",
                       file=sys.stderr)
             cmd += ["--autocompact", str(ac)]
+        return cmd
 
-        ac_note = f"autocompact {int(autocompact)//1000}k" if autocompact else "autocompact off"
-        print(f"[i] {model_id}: subscription-маршрут (claude -p в контейнере), "
-              f"{auth_note}, Pi={'да' if pi else 'нет'}, {ac_note}", flush=True)
-
+    def _invoke_claude(self, cmd, work, model_id, task):
+        """Запускает docker-команду, пишет transcript.jsonl и claude_raw.json.
+        Возвращает (raw, proc, err): err -- строка stop_reason при неудаче запуска
+        (тогда raw/proc = None), иначе None."""
         transcript = (work / "transcript.jsonl").open("w", encoding="utf-8")
         transcript.write(json.dumps({"kind": "subscribed_start", "model": model_id,
                                      "task": task}, ensure_ascii=False) + "\n")
@@ -1115,48 +1146,51 @@ class ClaudeModel(BaseModel):
                                   encoding="utf-8", errors="replace")
         except Exception as exc:
             transcript.close()
-            return {"model": model_id, "stop_reason": f"не запустился claude: {exc}"}
-
+            return None, None, f"не запустился claude: {exc}"
         raw = proc.stdout or ""
         (work / "claude_raw.json").write_text(raw + "\n---STDERR---\n" + (proc.stderr or ""),
                                               encoding="utf-8")
         transcript.write(json.dumps({"kind": "subscribed_done",
                                      "exit_code": proc.returncode}, ensure_ascii=False) + "\n")
         transcript.close()
+        return raw, proc, None
 
-        # Разбор JSON-вывода claude Code.
-        turns = None
-        cost = None
+    @staticmethod
+    def _parse_result(raw, proc, max_usd):
+        """Разбирает JSON-вывод claude -p -> (turns, cost, stop_reason). Отличает
+        штатные остановки (лимит окна Pro, наш бюджет) от настоящих ошибок: при
+        обрыве находки/отчёт уже на диске (пишем по ходу), это не сбой."""
+        turns = cost = None
         stop_reason = f"claude -p код возврата {proc.returncode}"
         try:
             d = json.loads(raw)
             turns = d.get("num_turns")
             cost = d.get("total_cost_usd")
-            if d.get("is_error"):
-                # Остановка по --max-budget-usd приходит как is_error, но это НЕ
-                # сбой: находки/отчёт уже на диске (пишем по ходу). Отличаем её от
-                # настоящей ошибки -- по тексту/подтипу или по расходу у потолка.
-                res_txt = str(d.get("result", ""))
-                subtype = str(d.get("subtype", ""))
-                low = (res_txt + " " + subtype).lower()
-                near_budget = bool(max_usd) and isinstance(cost, (int, float)) \
-                    and cost >= max_usd * 0.95
-                if "session limit" in low or ("limit" in low and "reset" in low):
-                    # Исчерпано 5-часовое окно Pro -- НЕ ошибка и НЕ наш бюджет:
-                    # штатный предел подписки (напр. "resets 12:30pm (UTC)").
-                    stop_reason = ("остановлено: исчерпан лимит окна подписки -- "
-                                   + (res_txt[:150] or "окно сбросится позже"))
-                elif "budget" in low or near_budget:
-                    stop_reason = f"остановлено по бюджету (${cost} из ${max_usd})"
-                else:
-                    stop_reason = "claude ошибка: " + (res_txt[:200] or subtype
-                                                       or "(без описания)")
+            if not d.get("is_error"):
+                return turns, cost, "claude завершил"
+            res_txt = str(d.get("result", ""))
+            subtype = str(d.get("subtype", ""))
+            low = (res_txt + " " + subtype).lower()
+            near_budget = bool(max_usd) and isinstance(cost, (int, float)) \
+                and cost >= max_usd * 0.95
+            if "session limit" in low or ("limit" in low and "reset" in low):
+                # Исчерпано 5-часовое окно Pro -- НЕ ошибка и НЕ наш бюджет:
+                # штатный предел подписки (напр. "resets 12:30pm (UTC)").
+                stop_reason = ("остановлено: исчерпан лимит окна подписки -- "
+                               + (res_txt[:150] or "окно сбросится позже"))
+            elif "budget" in low or near_budget:
+                stop_reason = f"остановлено по бюджету (${cost} из ${max_usd})"
             else:
-                stop_reason = "claude завершил"
+                stop_reason = "claude ошибка: " + (res_txt[:200] or subtype or "(без описания)")
         except Exception:
             if proc.returncode != 0:
                 stop_reason = "claude упал: " + (proc.stderr or raw)[:200]
+        return turns, cost, stop_reason
 
+    @staticmethod
+    def _read_findings(work):
+        """findings.jsonl -> список записей. Нераспарсенную строку сохраняем как
+        {'text': ...}, чтобы она тоже попала в счёт и фолбэк-отчёт."""
         ff = work / "findings.jsonl"
         items = []
         if ff.is_file():
@@ -1167,43 +1201,29 @@ class ClaudeModel(BaseModel):
                 try:
                     items.append(json.loads(ln))
                 except Exception:
-                    items.append({"text": ln})  # неразобранную строку тоже учтём
-        findings = len(items)
+                    items.append({"text": ln})
+        return items
 
-        # Фолбэк-отчёт: обрыв (бюджет/лимит) мог оставить нас без report.md, хотя
-        # находки писались по ходу через re-note. Собираем минимальный отчёт из
-        # них, чтобы у судьи всегда был прозаический срез, а прогон не выглядел
-        # пустым. Настоящий report.md, если он есть, не трогаем.
+    @staticmethod
+    def _write_fallback_report(work, items, stop_reason, model_id):
+        """Обрыв (бюджет/лимит окна) мог оставить нас без report.md, хотя находки
+        писались по ходу через re-note. Собираем минимальный отчёт из них, чтобы у
+        судьи всегда был прозаический срез. Настоящий report.md не трогаем."""
         report_path = work / "report.md"
-        if not report_path.is_file() and items:
-            md = [f"# Отчёт (автосборка из находок)", "",
-                  f"_report.md не был записан ({stop_reason}); собран автоматически "
-                  f"из {len(items)} находок re-note._", "",
-                  "## Находки", ""]
-            for it in items:
-                conf, addr, text = it.get("confidence", "?"), it.get("addr", ""), it.get("text", "")
-                head = f"- [{conf}]" + (f" `{addr}`" if addr else "")
-                md.append(f"{head} {text}")
-                if it.get("evidence"):
-                    md.append(f"    - доказательство: {it['evidence']}")
-            report_path.write_text("\n".join(md) + "\n", encoding="utf-8")
-            print(f"[i] {model_id}: report.md не записан -> собрал фолбэк из "
-                  f"{len(items)} находок", flush=True)
-
-        return {
-            "model": model_id,
-            "turns": turns,
-            "usd": round(cost, 4) if isinstance(cost, (int, float)) else cost,
-            "seconds": round(time.time() - t0),
-            "stop_reason": stop_reason,
-            "pi": f"{pi.user}@{pi.host}" if pi else None,
-            # max_usd (бюджет) -- часть отпечатка: прогоны на $1 и $10 по-разному
-            # глубоки, судья не должен считать их сопоставимыми (симметрично litellm).
-            "attack": attack_fingerprint("subscription-claude", system_prompt, task, pi,
-                                         subscription_model=model_id, max_usd=max_usd),
-            "findings": findings,
-            "report": (work / "report.md").is_file(),
-        }
+        if report_path.is_file() or not items:
+            return
+        md = ["# Отчёт (автосборка из находок)", "",
+              f"_report.md не был записан ({stop_reason}); собран автоматически из "
+              f"{len(items)} находок re-note._", "", "## Находки", ""]
+        for it in items:
+            conf, addr, text = it.get("confidence", "?"), it.get("addr", ""), it.get("text", "")
+            head = f"- [{conf}]" + (f" `{addr}`" if addr else "")
+            md.append(f"{head} {text}")
+            if it.get("evidence"):
+                md.append(f"    - доказательство: {it['evidence']}")
+        report_path.write_text("\n".join(md) + "\n", encoding="utf-8")
+        print(f"[i] {model_id}: report.md не записан -> собрал фолбэк из "
+              f"{len(items)} находок", flush=True)
 
 
 def sha12(s):
