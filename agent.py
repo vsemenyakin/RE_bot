@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -802,29 +803,96 @@ def run_agent(model, task, sandbox, log_dir, max_turns, max_usd, cmd_timeout,
 # Базовый класс умеет только litellm-цикл (нынешний run_agent, без изменений).
 # ClaudeModel (шаг 2) добавит run_subscribed и выбор маршрута по preferred_run_type.
 # GenericModel -- пусто: любая модель без своего класса идёт через litellm.
+@dataclass
+class RunContext:
+    """Всё, что нужно для ОДНОГО прогона модели -- КАК её запускать. Отдельно от
+    ModelParams (ЧТО за модель: name/litellm_model/subscription_model). Собирается
+    в main из args и подготовленных путей; развязывает модель с argparse -- модель
+    больше не знает про структуру CLI.
+    """
+    work: Path
+    task: str
+    label: str = "model"
+    pi: object = None
+    deps: tuple = ()
+    image: str = "re-workbench:latest"
+    system_prompt: str = SYSTEM_PROMPT
+    litellm_model: str = ""          # args.model -- имя для LiteLLM и метка контейнера
+    max_usd: float = 5.0
+    max_turns: int = 80
+    max_tokens: int = 8192
+    cmd_timeout: int = 300
+    max_retries: int = 4
+    retry_delay: int = 20
+    wrap_at: float = 0.75
+    use_cache: bool = True
+    keep_container: bool = False
+    autocompact: int = 100_000       # только для subscription (см. run_subscribed)
+
+
 class BaseModel:
     def __init__(self, params):
         self.params = params or {}
         self.name = self.params.get("name", "")
 
-    def run(self, preferred_run_type="litellm", **run_args):
-        """Точка входа. База умеет только litellm; preferred игнорирует."""
-        return self.run_litellm(**run_args)
+    def route(self, preferred_run_type):
+        """Фактический маршрут прогона -- единый источник правды (его же зовёт main
+        для preflight/баннера). База умеет только litellm."""
+        return "litellm"
+
+    def run(self, preferred_run_type, ctx):
+        """Оркестрация выбранного маршрута. База -> всегда litellm."""
+        return self._run_litellm_route(ctx)
 
     def run_litellm(self, **run_args):
         # Тонкая обёртка над отлаженным run_agent -- поведение не меняется.
         return run_agent(**run_args)
 
+    def _run_litellm_route(self, ctx):
+        """litellm-маршрут: поднимает Sandbox, гоняет цикл, закрывает контейнер и
+        Pi, достраивает частичный summary (pi/attack/findings/report)."""
+        sandbox = Sandbox(
+            image=ctx.image, workdir=ctx.work,
+            name=f"re-{ctx.label[:30]}-{uuid.uuid4().hex[:6]}", agent_label=ctx.litellm_model,
+        )
+        sandbox.start()
+        print(f"[i] контейнер  : {sandbox.name}")
+        try:
+            summary = self.run_litellm(
+                model=ctx.litellm_model, task=ctx.task, sandbox=sandbox, log_dir=ctx.work,
+                max_turns=ctx.max_turns, max_usd=ctx.max_usd, cmd_timeout=ctx.cmd_timeout,
+                max_tokens=ctx.max_tokens, max_retries=ctx.max_retries,
+                retry_delay=ctx.retry_delay, pi=ctx.pi, wrap_at=ctx.wrap_at,
+                use_cache=ctx.use_cache, deps=ctx.deps)
+        except KeyboardInterrupt:
+            summary = {"model": ctx.litellm_model, "stop_reason": "прервано пользователем"}
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            summary = {"model": ctx.litellm_model,
+                       "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
+        finally:
+            sandbox.stop(keep=ctx.keep_container)
+            if ctx.pi is not None:
+                ctx.pi.close()
+        # run_agent даёт частичный summary -- дополняем его.
+        summary["pi"] = f"{ctx.pi.user}@{ctx.pi.host}" if ctx.pi else None
+        summary["attack"] = attack_fingerprint("litellm", ctx.system_prompt, ctx.task, ctx.pi,
+                                               max_turns=ctx.max_turns, max_usd=ctx.max_usd)
+        summary["findings"] = sum(1 for _ in (ctx.work / "findings.jsonl").open(encoding="utf-8"))
+        summary["report"] = (ctx.work / "report.md").is_file()
+        return summary
+
 
 class GenericModel(BaseModel):
     """Любая модель, для которой нет специализированного класса. Только litellm."""
 
-    def run(self, preferred_run_type="litellm", **run_args):
+    def run(self, preferred_run_type, ctx):
         if preferred_run_type and preferred_run_type != "litellm":
-            print(f"[i] {self.name or run_args.get('model','?')}: режим "
+            print(f"[i] {self.name or ctx.litellm_model or '?'}: режим "
                   f"'{preferred_run_type}' не поддерживается этой моделью, иду litellm",
                   file=sys.stderr)
-        return self.run_litellm(**run_args)
+        return super().run(preferred_run_type, ctx)
 
 
 CLAUDE_CRED_PATH = Path.home() / ".claude" / ".credentials.json"
@@ -902,13 +970,40 @@ class ClaudeModel(BaseModel):
     def supports_subscription(self):
         return bool(self.params.get("subscription_model"))
 
-    def run(self, preferred_run_type="litellm", **run_args):
+    def route(self, preferred_run_type):
+        """subscription -- только если он предпочтён И настроен (есть
+        subscription_model); иначе litellm. Тихо, без печати (предупреждает run)."""
         if preferred_run_type == "subscription" and self.supports_subscription():
-            return self.run_subscribed(**run_args)
+            return "subscription"
+        return "litellm"
+
+    def run(self, preferred_run_type, ctx):
+        if self.route(preferred_run_type) == "subscription":
+            return self._run_subscription_route(ctx)
         if preferred_run_type == "subscription":
             print(f"[i] {self.name}: subscription не настроен (нет subscription_model), "
                   f"иду litellm", file=sys.stderr)
-        return self.run_litellm(**run_args)
+        return super().run(preferred_run_type, ctx)
+
+    def _run_subscription_route(self, ctx):
+        """subscription-маршрут: своего контейнера (claude -p) достаточно, Sandbox не
+        нужен. run_subscribed сам формирует полный summary. Закрывает Pi."""
+        model_id = self.params.get("subscription_model")
+        try:
+            return self.run_subscribed(
+                work=ctx.work, task=ctx.task, system_prompt=ctx.system_prompt,
+                image=ctx.image, deps=ctx.deps, pi=ctx.pi, max_usd=ctx.max_usd,
+                autocompact=ctx.autocompact)
+        except KeyboardInterrupt:
+            return {"model": model_id, "stop_reason": "прервано пользователем"}
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return {"model": model_id,
+                    "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
+        finally:
+            if ctx.pi is not None:
+                ctx.pi.close()
 
     def run_subscribed(self, work, task, system_prompt, image="re-workbench:latest",
                        deps=(), pi=None, max_usd=None, autocompact=100_000,
@@ -1192,30 +1287,12 @@ def build_parser():
     return ap
 
 
-def decide_route(args):
-    """Создаёт объект модели и решает маршрут прогона. Возвращает (model_obj,
-    want_sub). Маршрут subscription -- если он предпочтён И модель это умеет
-    (есть subscription_model); иначе litellm. Свежесть токена здесь НЕ проверяем:
-    это забота ClaudeModel.run_subscribed (она вернёт summary со stop_reason, без
-    отката в платный litellm), чтобы проверка жила там, где ей место."""
-    model_obj = create_model({"name": args.model_name,
-                              "litellm_model": args.model,
-                              "subscription_model": args.subscription_model})
-    supports_sub = getattr(model_obj, "supports_subscription", lambda: False)()
-    want_sub = args.prefer_run_type == "subscription" and supports_sub
-    if args.prefer_run_type == "subscription" and not supports_sub:
-        # Модель не умеет подписку (напр. Grok) -- нормально, тихо идём litellm.
-        print(f"[i] {args.model_name or args.model}: subscription не поддерживается "
-              f"этой моделью, иду litellm", file=sys.stderr)
-    return model_obj, want_sub
-
-
-def prepare_workdir(args, sample, run_id, want_sub):
+def prepare_workdir(args, sample, run_id, route):
     """Готовит рабочий каталог прогона: имя-метка, каталог, копия образца (модель
     ковыряет свой экземпляр, не оригинал), пустой findings.jsonl и копии
     зависимостей с ИСХОДНЫМИ именами (.so ищется по SONAME, данные по имени --
-    переименовывать нельзя). Печатает баннер прогона. Возвращает (work, label,
-    dep_names)."""
+    переименовывать нельзя). Печатает баннер прогона (route -- строка маршрута
+    "subscription"/"litellm"). Возвращает (work, label, dep_names)."""
     import shutil
     label_src = args.model or args.subscription_model or args.model_name or "model"
     label = label_src.replace("/", "_").replace(":", "_")
@@ -1239,8 +1316,9 @@ def prepare_workdir(args, sample, run_id, want_sub):
     if dep_names:
         print(f"[i] зависимости: {', '.join(dep_names)} (в /work)")
 
-    print(f"[i] маршрут    : {'subscription (claude -p)' if want_sub else 'litellm'}")
-    print(f"[i] модель     : {args.subscription_model if want_sub else args.model}")
+    sub = route == "subscription"
+    print(f"[i] маршрут    : {'subscription (claude -p)' if sub else 'litellm'}")
+    print(f"[i] модель     : {args.subscription_model if sub else args.model}")
     print(f"[i] образец    : {sample.name} -> {target}")
     print(f"[i] каталог    : {work}")
     return work, label, dep_names
@@ -1297,65 +1375,6 @@ def write_summary(work, summary):
         print("  [!] report.md не написан -- модель не довела работу до конца")
 
 
-def run_subscription_route(args, model_obj, work, dep_names, pi):
-    """subscription-маршрут: своего контейнера (claude -p) достаточно, Sandbox не
-    нужен. run_subscribed сам формирует полный summary (attack/findings/report/pi).
-    Закрывает Pi в любом исходе. Возвращает summary."""
-    try:
-        return model_obj.run(
-            preferred_run_type="subscription",
-            work=work, task=args.task, system_prompt=SYSTEM_PROMPT,
-            image=args.image, deps=dep_names, pi=pi, max_usd=args.max_usd)
-    except KeyboardInterrupt:
-        return {"model": args.subscription_model, "stop_reason": "прервано пользователем"}
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        return {"model": args.subscription_model,
-                "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
-    finally:
-        if pi is not None:
-            pi.close()
-
-
-def run_litellm_route(args, model_obj, work, label, dep_names, pi):
-    """litellm-маршрут: поднимает Sandbox-контейнер, гоняет модель, закрывает
-    контейнер и Pi. run_agent даёт частичный summary -- достраиваем его
-    (pi/attack-fingerprint/findings/report). Возвращает summary."""
-    sandbox = Sandbox(
-        image=args.image, workdir=work,
-        name=f"re-{label[:30]}-{uuid.uuid4().hex[:6]}", agent_label=args.model,
-    )
-    sandbox.start()
-    print(f"[i] контейнер  : {sandbox.name}")
-    try:
-        summary = model_obj.run(
-            preferred_run_type="litellm",
-            model=args.model, task=args.task, sandbox=sandbox, log_dir=work,
-            max_turns=args.max_turns, max_usd=args.max_usd, cmd_timeout=args.cmd_timeout,
-            max_tokens=args.max_tokens, max_retries=args.max_retries,
-            retry_delay=args.retry_delay, pi=pi, wrap_at=args.wrap_at,
-            use_cache=not args.no_cache, deps=dep_names)
-    except KeyboardInterrupt:
-        summary = {"model": args.model, "stop_reason": "прервано пользователем"}
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        summary = {"model": args.model,
-                   "stop_reason": f"аварийное завершение: {type(exc).__name__}: {exc}"}
-    finally:
-        sandbox.stop(keep=args.keep_container)
-        if pi is not None:
-            pi.close()
-    # litellm-путь: run_agent даёт частичный summary, дополняем его.
-    summary["pi"] = f"{pi.user}@{pi.host}" if pi else None
-    summary["attack"] = attack_fingerprint("litellm", SYSTEM_PROMPT, args.task, pi,
-                                           max_turns=args.max_turns, max_usd=args.max_usd)
-    summary["findings"] = sum(1 for _ in (work / "findings.jsonl").open(encoding="utf-8"))
-    summary["report"] = (work / "report.md").is_file()
-    return summary
-
-
 # ---------------------------------------------------------------------------
 def main():
     args = build_parser().parse_args()
@@ -1388,22 +1407,33 @@ def main():
     if not sample.is_file():
         sys.exit(f"нет такого файла: {sample}")
 
-    # Модель и МАРШРУТ. Решаем заранее: от маршрута зависит Sandbox и ключи API.
-    model_obj, want_sub = decide_route(args)
+    # Модель и МАРШРУТ. Маршрут решает сама модель (единый источник правды); main
+    # лишь спрашивает его заранее -- от него зависят preflight и баннер.
+    model_obj = create_model({"name": args.model_name,
+                              "litellm_model": args.model,
+                              "subscription_model": args.subscription_model})
+    route = model_obj.route(args.prefer_run_type)
 
-    if not want_sub:
-        # litellm-маршрут: модель и ключ нужны до запуска контейнера.
+    if route == "litellm":
+        # litellm-маршрут: модель и ключ нужны до подготовки каталога (не копируем
+        # зря сотни МБ образца/зависимостей, если ключа нет).
         preflight_litellm(args.model)
 
-    work, label, dep_names = prepare_workdir(args, sample, run_id, want_sub)
+    work, label, dep_names = prepare_workdir(args, sample, run_id, route)
 
     # Pi необязательна, нужна обоим маршрутам (креды/доступ к живой Pi).
     pi = setup_pi(args, run_id)
 
-    if want_sub:
-        summary = run_subscription_route(args, model_obj, work, dep_names, pi)
-    else:
-        summary = run_litellm_route(args, model_obj, work, label, dep_names, pi)
+    # Весь per-run вход -- в RunContext; ветвление litellm/subscription теперь
+    # инкапсулировано в model_obj.run(), вызов чистый.
+    ctx = RunContext(
+        work=work, label=label, task=args.task, pi=pi, deps=dep_names,
+        image=args.image, system_prompt=SYSTEM_PROMPT, litellm_model=args.model,
+        max_usd=args.max_usd, max_turns=args.max_turns, max_tokens=args.max_tokens,
+        cmd_timeout=args.cmd_timeout, max_retries=args.max_retries,
+        retry_delay=args.retry_delay, wrap_at=args.wrap_at,
+        use_cache=not args.no_cache, keep_container=args.keep_container)
+    summary = model_obj.run(args.prefer_run_type, ctx)
 
     write_summary(work, summary)
 
