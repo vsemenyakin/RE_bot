@@ -5,9 +5,10 @@
 #   subscription_* -- через подписку Claude Code, claude -p
 #                     (subscription_budget -- лимит API-эквивалента -> --max-budget-usd,
 #                      реальные деньги НЕ тратятся, расход из лимитов Pro)
-# preferred_run_type выбирает активный маршрут. subscription требует свежий токен
-# (claude auth login раз в ~28 дней) и только для ДОВЕРЕННОГО бинаря (контейнер
-# Claude идёт с сетью и доступом к Pi).
+# preferred_run_type выбирает активный маршрут. subscription требует токен доступа:
+# либо годовой CLAUDE_CODE_OAUTH_TOKEN из `claude setup-token` (удобнее), либо
+# обычный `claude auth login` (access живёт ~8 ч, сам не обновляется). Маршрут --
+# только для ДОВЕРЕННОГО бинаря (контейнер Claude идёт с сетью и доступом к Pi).
 
 name = claude
 
