@@ -904,23 +904,32 @@ class ClaudeModel(BaseModel):
         model_id = self.params.get("subscription_model")
         work = Path(work)
 
-        # Мёртв refresh (~28 дней) -> токен без браузера не восстановить.
-        left = token_expiry_hours(cred_path)
-        if left is None:
-            return {"model": model_id, "stop_reason": "нет токена подписки: "
-                    f"{cred_path} (сделай claude auth login)"}
-        if left < 0.2:
-            return {"model": model_id, "stop_reason":
-                    f"refresh-токен подписки истёк (~{left:.1f} ч) -- нужен браузерный "
-                    f"claude auth login (это раз в ~28 дней)"}
-        # Протух access (~8 ч) -> claude -p сам его НЕ обновит (headless-баг
-        # #50743), а программный refresh даёт 429 -- отсекаем заранее с понятной
-        # инструкцией, иначе внутри контейнера будет криптовый 401.
-        acc = access_expiry_hours(cred_path)
-        if acc is not None and acc < 0.2:
-            return {"model": model_id, "stop_reason":
-                    f"access-токен подписки протух (~{acc:.1f} ч) -- сделай "
-                    f"claude auth login (access живёт ~8 ч, авто-обновления нет)"}
+        # Аутентификация подписки -- два пути:
+        #  1) CLAUDE_CODE_OAUTH_TOKEN (claude setup-token, ~1 год): статический
+        #     токен через env. Не истекает каждые 8 ч, рефреш не нужен, креды не
+        #     монтируем. Приоритетный, если задан.
+        #  2) .credentials.json (обычный claude auth login, access ~8 ч): фолбэк.
+        #     Access сам НЕ обновляется (headless-баг #50743), программный refresh
+        #     даёт 429 -- поэтому срок проверяем заранее, а не ловим 401 внутри.
+        oat = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        if oat:
+            auth_note = "oauth-token (env, ~1 год)"
+        else:
+            left = token_expiry_hours(cred_path)
+            if left is None:
+                return {"model": model_id, "stop_reason": "нет токена подписки: "
+                        f"{cred_path} -- сделай claude auth login или задай "
+                        f"CLAUDE_CODE_OAUTH_TOKEN"}
+            if left < 0.2:
+                return {"model": model_id, "stop_reason":
+                        f"refresh-токен подписки истёк (~{left:.1f} ч) -- нужен браузерный "
+                        f"claude auth login (это раз в ~28 дней)"}
+            acc = access_expiry_hours(cred_path)
+            if acc is not None and acc < 0.2:
+                return {"model": model_id, "stop_reason":
+                        f"access-токен подписки протух (~{acc:.1f} ч) -- сделай "
+                        f"claude auth login (access живёт ~8 ч, авто-обновления нет)"}
+            auth_note = f"credentials.json (~{left:.1f} ч до refresh)"
 
         # Полный промпт claude: наша методика + инструкция про Pi-обёртки этого режима.
         full_prompt = system_prompt + SUBSCRIPTION_PI_NOTE
@@ -928,7 +937,15 @@ class ClaudeModel(BaseModel):
         cmd = [
             "docker", "run", "--rm",
             "--user", "reuser", "-e", "HOME=/home/reuser",
-            "-v", f"{Path(cred_path).resolve()}:/home/reuser/.claude/.credentials.json",
+        ]
+        if oat:
+            # Пробрасываем токен БЕЗ значения -- docker берёт его из окружения
+            # процесса (main() уже сделал load_dotenv), секрет не попадает в argv.
+            cmd += ["-e", "CLAUDE_CODE_OAUTH_TOKEN"]
+        else:
+            cmd += ["-v",
+                    f"{Path(cred_path).resolve()}:/home/reuser/.claude/.credentials.json"]
+        cmd += [
             "-v", f"{work.resolve()}:/work",
             "-e", "RE_AGENT=subscription-claude",
         ]
@@ -968,7 +985,7 @@ class ClaudeModel(BaseModel):
 
         ac_note = f"autocompact {int(autocompact)//1000}k" if autocompact else "autocompact off"
         print(f"[i] {model_id}: subscription-маршрут (claude -p в контейнере), "
-              f"токен ~{left:.1f} ч, Pi={'да' if pi else 'нет'}, {ac_note}", flush=True)
+              f"{auth_note}, Pi={'да' if pi else 'нет'}, {ac_note}", flush=True)
 
         transcript = (work / "transcript.jsonl").open("w", encoding="utf-8")
         transcript.write(json.dumps({"kind": "subscribed_start", "model": model_id,
