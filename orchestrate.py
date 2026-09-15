@@ -14,9 +14,8 @@
 замер стойкости обнуляется. В контейнеры уходит лишь бинарь (это делает agent.py).
 Оценка -- отдельный шаг (judge.py) на хосте, после атаки.
 
-    python orchestrate.py --sample samples/protected --budget-total 10 \\
-        --models openrouter/anthropic/claude-opus-4.5,openrouter/x-ai/grok-4,\\
-                 openrouter/qwen/qwen3-max,openrouter/google/gemini-2.5-pro
+    python orchestrate.py --sample samples/protected \\
+        --attack-models models/attack_claude.txt,models/attack_grok.txt
 """
 import argparse
 import concurrent.futures
@@ -27,38 +26,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from model_desc import parse_model_desc
+
 HERE = Path(__file__).resolve().parent
-
-
-def parse_model_desc(spec):
-    """Спецификация модели -> dict со всеми её настройками.
-
-    spec -- путь к файлу описания (models/claude.txt) ИЛИ прямое имя litellm-модели
-    (обратная совместимость: openrouter/... трактуется как только-litellm).
-
-    Настройки маршрутов симметричны: пара *_model + *_budget на каждый маршрут.
-      name, litellm_model, litellm_budget,
-      subscription_model, subscription_budget,
-      preferred_run_type ('litellm' по умолчанию, если не задан).
-    """
-    base = {"name": "", "litellm_model": "", "litellm_budget": "",
-            "subscription_model": "", "subscription_budget": "",
-            "preferred_run_type": "litellm"}
-    p = Path(spec)
-    if p.is_file():
-        d = dict(base)
-        for line in p.read_text(encoding="utf-8").splitlines():
-            line = line.split("#", 1)[0].strip()
-            if "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            d[k.strip()] = v.strip().strip('"').strip("'")
-        d["id"] = d.get("litellm_model") or d.get("subscription_model") or d.get("name") or spec
-        return d
-    d = dict(base)
-    d["litellm_model"] = spec
-    d["id"] = spec
-    return d
 
 
 def label_for(desc):
@@ -105,9 +75,9 @@ def main():
     ap.add_argument("--sample", required=True, help="бинарь для атаки")
     ap.add_argument("--deps", nargs="*", default=[],
                     help="зависимости бинаря (библиотеки, данные) -- доступны атакующим")
-    ap.add_argument("--models", required=True,
-                    help="через запятую: пути к файлам описания моделей (models/claude.txt) "
-                         "или прямые имена litellm-моделей")
+    ap.add_argument("--attack-models", required=True,
+                    help="через запятую: пути к файлам описания атакующих моделей "
+                         "(models/attack_*.txt) или прямые имена litellm-моделей")
     # Маршрут и бюджет настраиваются per-model в файлах описания
     # (preferred_run_type, litellm_budget, subscription_budget)
     ap.add_argument("--max-turns", type=int, default=80)
@@ -124,9 +94,9 @@ def main():
     if not sample.is_file():
         sys.exit(f"нет такого файла: {sample}")
 
-    specs = [m.strip() for m in args.models.split(",") if m.strip()]
+    specs = [m.strip() for m in args.attack_models.split(",") if m.strip()]
     if not specs:
-        sys.exit("не заданы модели")
+        sys.exit("не заданы атакующие модели")
     descs = [parse_model_desc(s) for s in specs]
     models = [d["id"] for d in descs]
 

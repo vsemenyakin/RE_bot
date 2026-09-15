@@ -9,9 +9,13 @@ sample = samples/kerbside
 # Зависимости бинаря через пробел: библиотеки, данные, входные файлы.
 deps = samples/libonnxruntime.so samples/vehicle.onnx samples/scene.krw
 
-# Модели через запятую: пути к файлам описания (models/claude.txt и т.п.).
+# Атакующие модели через запятую: пути к файлам описания (models/attack_*.txt).
 # Можно и прямые litellm-имена (openrouter/...) -- тогда только litellm.
-models = models/claude.txt
+attack_models = models/attack_claude.txt
+
+# Модель-судья: путь к файлу описания (или прямое litellm-имя). Судья ходит
+# только через litellm (подписка пока не поддерживается) -- см. models/judge_claude.txt.
+judge_model = models/judge_claude.txt
 
 # Метка версии бинаря -- по ней судья сравнивает регрессии между версиями.
 label = kerbside-0.1.0

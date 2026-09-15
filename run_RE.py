@@ -22,8 +22,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-# Ключи из RE_args, относящиеся к эталону, а не к атаке: в orchestrate не идут.
-JUDGE_KEYS = {"source", "targets-out", "cargo"}
+# Ключи из RE_args, относящиеся к эталону/судье, а не к атаке: в orchestrate не
+# идут (judge_model уходит в judge.py, остальные -- в targets_gen/judge).
+JUDGE_KEYS = {"source", "targets-out", "cargo", "judge_model"}
 FLAG_KEYS = {"no-pi"}  # ключи-флаги без значения
 
 
@@ -58,7 +59,9 @@ def main():
                     help="файл аргументов (по умолчанию RE_args.txt рядом со скриптом)")
     ap.add_argument("--skip-targets", action="store_true",
                     help="не пересобирать targets.yaml (использовать существующий)")
-    ap.add_argument("--judge", default=None, help="модель-судья (иначе дефолт judge.py)")
+    ap.add_argument("--judge", default=None,
+                    help="модель-судья: путь к описанию (models/judge_*.txt) или прямое "
+                         "litellm-имя; переопределяет judge_model из RE_args")
     opts = ap.parse_args()
 
     args_path = Path(opts.args)
@@ -103,10 +106,13 @@ def main():
     run_step("атака ансамблем (orchestrate.py)", cmd)
 
     # === ЭТАП 3: оценка судьёй ===
+    # Модель-судья: из RE_args (judge_model) либо CLI-override (--judge) с
+    # приоритетом. Пусто -> judge.py возьмёт свой дефолт.
+    judge_spec = opts.judge or conf.get("judge_model")
     cmd = [py, str(HERE / "judge.py"), "--run", str(run_dir),
            "--targets", targets_out, "--source", source]
-    if opts.judge:
-        cmd += ["--judge", opts.judge]
+    if judge_spec:
+        cmd += ["--judge", judge_spec]
     run_step("оценка стойкости (judge.py)", cmd)
 
     res = run_dir / "resilience.json"

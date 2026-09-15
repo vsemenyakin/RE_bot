@@ -23,6 +23,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from model_desc import parse_model_desc
+
 # Судья и бинарь порождают произвольный Unicode; консоль Windows кодирует в
 # cp1251 и падает на символах вроде "└". Меняем только режим ошибок, не кодировку.
 for _stream in (sys.stdout, sys.stderr):
@@ -193,6 +195,37 @@ def call_judge(model, prompt, max_tokens=8000):
     return text, cost
 
 
+def resolve_judge(spec):
+    """Описание судьи (путь к models/judge_*.txt или прямое litellm-имя) ->
+    (litellm_model, budget). Судья ходит ТОЛЬКО через litellm: если в описании
+    preferred_run_type=subscription -- предупреждаем и берём litellm. Пустой
+    litellm_model -> ошибка. budget -- строка litellm_budget ('' если не задан)."""
+    d = parse_model_desc(spec)
+    if d.get("preferred_run_type") == "subscription":
+        print("[i] Запуск судьи по подписке пока не поддерживается, "
+              "переключаюсь на litellm", file=sys.stderr)
+    model = d.get("litellm_model", "")
+    if not model:
+        sys.exit(f"[!] у судьи ({spec}) не задан litellm_model -- укажи его в описании "
+                 f"(судья работает только через litellm)")
+    return model, d.get("litellm_budget", "")
+
+
+def estimate_judge_cost(model, prompt, max_tokens):
+    """Оценка стоимости ОДНОГО вызова судьи в USD: вход = токены промпта, выход =
+    потолок max_tokens (верхняя граница). None, если цену модели litellm не знает."""
+    try:
+        import litellm
+        litellm.suppress_debug_info = True
+        in_tok = litellm.token_counter(
+            model=model, messages=[{"role": "user", "content": prompt}])
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=model, prompt_tokens=in_tok, completion_tokens=max_tokens)
+        return prompt_cost + completion_cost
+    except Exception:
+        return None
+
+
 def parse_verdicts(text):
     """Достаёт JSON из ответа судьи, даже если он обёрнут в ```json ... ```."""
     t = text.strip()
@@ -318,7 +351,8 @@ def main():
     ap.add_argument("--targets", required=True, help="targets.yaml с эталоном (в truth/)")
     ap.add_argument("--source", required=True, help="каталог исходников-эталона (truth/)")
     ap.add_argument("--judge", default="openrouter/anthropic/claude-opus-4.5",
-                    help="модель-судья, самая сильная")
+                    help="модель-судья: путь к описанию (models/judge_*.txt) или прямое "
+                         "litellm-имя. Самая сильная модель. Работает только через litellm")
     ap.add_argument("--dry-run", action="store_true",
                     help="собрать промпт судьи и показать его, не обращаясь к модели")
     args = ap.parse_args()
@@ -362,8 +396,28 @@ def main():
         print("[i] --dry-run: к модели не обращаюсь")
         return
 
-    print(f"[i] судья    : {args.judge}")
-    text, cost = call_judge(args.judge, prompt)
+    judge_model, judge_budget = resolve_judge(args.judge)
+    print(f"[i] судья    : {judge_model}")
+
+    # Бюджет судьи -- предохранитель ДО единственного вызова (не стоп по ходу, как
+    # у атакующих: обрывать нечего). Оценка дороже потолка -> отказ; цену узнать
+    # нельзя -> предупреждаем и продолжаем (как с 'usd: неизвестно' у атакующих).
+    if judge_budget not in ("", None):
+        try:
+            budget = float(judge_budget)
+        except ValueError:
+            sys.exit(f"[!] litellm_budget судьи не число: {judge_budget!r}")
+        est = estimate_judge_cost(judge_model, prompt, 8000)
+        if est is None:
+            print(f"[i] стоимость судьи оценить не удалось (цена {judge_model} неизвестна "
+                  f"litellm) -- бюджет ${budget} не проверяю", file=sys.stderr)
+        elif est > budget:
+            sys.exit(f"[!] оценка стоимости судьи ~${est:.2f} превышает бюджет ${budget} "
+                     f"-- увеличь judge litellm_budget или возьми модель дешевле")
+        else:
+            print(f"[i] оценка судьи ~${est:.3f} (бюджет ${budget})")
+
+    text, cost = call_judge(judge_model, prompt)
     (run_dir / "judge_raw.txt").write_text(text, encoding="utf-8")
     try:
         verdicts = parse_verdicts(text)
@@ -382,7 +436,7 @@ def main():
         "version": version,
         "run": run_dir.name,
         "judged_at": datetime.now().isoformat(timespec="seconds"),
-        "judge_model": args.judge,
+        "judge_model": judge_model,
         "judge_cost_usd": round(cost, 4) if cost else None,
         "attackers": list(reports),
         "attack_ok": attack_ok,

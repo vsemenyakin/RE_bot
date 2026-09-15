@@ -74,13 +74,17 @@ python run_RE.py        # или двойной клик по run_RE.cmd на Wi
 python targets_gen.py --source truth --out truth/protected.yaml --cargo truth/Cargo.toml
 
 # 1. Атака: ансамбль моделей вскрывает бинарь (эталон им недоступен)
+#    --attack-models: пути к описаниям (models/attack_*.txt) или прямые litellm-имена.
+#    Маршрут и бюджет каждой модели -- в её файле описания.
 python orchestrate.py --sample samples/kerbside \
     --deps samples/libonnxruntime.so samples/vehicle.onnx \
-    --models openrouter/anthropic/claude-opus-4.5,<второй-id-из-каталога> \
-    --budget-total 6 --label "kerbside-0.1.0"
+    --attack-models models/attack_claude.txt,models/attack_grok.txt \
+    --label "kerbside-0.1.0"
 
 # 2. Оценка: судья сверяет отчёты атакующих с исходником-эталоном
-python judge.py --run ens_<дата> --targets truth/protected.yaml --source truth
+#    --judge: путь к описанию (models/judge_*.txt) или прямое litellm-имя.
+python judge.py --run ens_<дата> --targets truth/protected.yaml --source truth \
+    --judge models/judge_claude.txt
 ```
 
 Бинарь идёт `--sample`, а нужные ему библиотеки и данные — `--deps` (копируются

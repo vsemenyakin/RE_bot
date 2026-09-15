@@ -1,0 +1,4 @@
+name = claude_litellm
+
+litellm_model  = openrouter/anthropic/claude-opus-4.8
+litellm_budget = 1

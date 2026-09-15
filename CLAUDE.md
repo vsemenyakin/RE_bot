@@ -38,10 +38,10 @@ python targets_gen.py --source truth --out truth/protected.yaml --cargo truth/Ca
 # 1. Ensemble attack (truth/ is NOT available to attackers)
 python orchestrate.py --sample samples/kerbside `
     --deps samples/libonnxruntime.so samples/vehicle.onnx `
-    --models models/claude.txt,models/grok.txt --label kerbside-0.1.0
+    --attack-models models/attack_claude.txt,models/attack_grok.txt --label kerbside-0.1.0
 
-# 2. Judge scores reports against the source-of-truth
-python judge.py --run ens_<date> --targets truth/protected.yaml --source truth
+# 2. Judge scores reports against the source-of-truth (--judge takes a desc path or a litellm name)
+python judge.py --run ens_<date> --targets truth/protected.yaml --source truth --judge models/judge_claude.txt
 
 # Single model, single run
 python agent.py --sample samples/myapp --model anthropic/claude-opus-4-5
@@ -83,8 +83,9 @@ Two **routes**, chosen per model:
 
 ### Configuration split
 
-- **`RE_args.txt`** — the session only (sample, deps, model list, label, truth paths).
-- **`models/*.txt`** — per model: `name`, `litellm_model` + `litellm_budget`, `subscription_model` + `subscription_budget`, `preferred_run_type`. Symmetric `*_model`/`*_budget` pairs. `preferred_run_type=subscription` without a `subscription_model` silently falls back to litellm; a missing budget for the active route is a hard error.
+- **`RE_args.txt`** — the session only: `sample`, `deps`, `attack_models` (comma-separated desc paths), `judge_model` (one desc path or litellm name), `label`, truth paths.
+- **`models/*.txt`** — one model description, parsed by the shared `model_desc.parse_model_desc` (used by both `orchestrate.py` for attackers and `judge.py` for the judge): `name`, `litellm_model` + `litellm_budget`, `subscription_model` + `subscription_budget`, `preferred_run_type`. Symmetric `*_model`/`*_budget` pairs. `preferred_run_type=subscription` without a `subscription_model` silently falls back to litellm; a missing budget for the active attack route is a hard error. `run_RE.py` routes `attack_models` → `orchestrate.py --attack-models` and `judge_model` → `judge.py --judge`.
+- **The judge** runs litellm-only. A judge desc with `preferred_run_type=subscription` warns and falls back to litellm. Its `litellm_budget`, if set, is a **pre-flight guard**: `judge.py` estimates the single call's cost (`litellm.token_counter` + `cost_per_token`) and refuses if it exceeds the budget (unlike attackers, there is no loop to stop mid-run); an unknown price warns and proceeds.
 
 ### The container image (`image/`, tag `re-workbench`)
 
