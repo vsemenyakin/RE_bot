@@ -844,13 +844,10 @@ class BaseModel:
         """Оркестрация выбранного маршрута. База -> всегда litellm."""
         return self._run_litellm_route(ctx)
 
-    def run_litellm(self, **run_args):
-        # Тонкая обёртка над отлаженным run_agent -- поведение не меняется.
-        return run_agent(**run_args)
-
     def _run_litellm_route(self, ctx):
-        """litellm-маршрут: поднимает Sandbox, гоняет цикл, закрывает контейнер и
-        Pi, достраивает частичный summary (pi/attack/findings/report)."""
+        """litellm-маршрут: поднимает Sandbox, гоняет отлаженный цикл run_agent,
+        закрывает контейнер и Pi, достраивает частичный summary
+        (pi/attack/findings/report)."""
         sandbox = Sandbox(
             image=ctx.image, workdir=ctx.work,
             name=f"re-{ctx.label[:30]}-{uuid.uuid4().hex[:6]}", agent_label=ctx.litellm_model,
@@ -858,7 +855,7 @@ class BaseModel:
         sandbox.start()
         print(f"[i] контейнер  : {sandbox.name}")
         try:
-            summary = self.run_litellm(
+            summary = run_agent(
                 model=ctx.litellm_model, task=ctx.task, sandbox=sandbox, log_dir=ctx.work,
                 max_turns=ctx.max_turns, max_usd=ctx.max_usd, cmd_timeout=ctx.cmd_timeout,
                 max_tokens=ctx.max_tokens, max_retries=ctx.max_retries,

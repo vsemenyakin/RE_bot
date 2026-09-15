@@ -74,10 +74,10 @@ The model only emits text; `agent.py` (on the host, with internet + API keys) ex
 
 Two **routes**, chosen per model:
 
-- **litellm** — via OpenRouter/LiteLLM API keys, **real money**. Uses a `Sandbox` container. `GenericModel` / `ClaudeModel.run_litellm`.
+- **litellm** — via OpenRouter/LiteLLM API keys, **real money**. `BaseModel._run_litellm_route` spins up a `Sandbox` container and drives the standalone `run_agent` loop (used by `GenericModel` and, by default, `ClaudeModel`).
 - **subscription** — `claude -p` run *inside* the container using a Claude Pro OAuth token (`~/.claude/.credentials.json`), spending the Pro window rather than money. `ClaudeModel.run_subscribed`; no `Sandbox` (the `claude -p` container is enough). Only `ClaudeModel` supports it; other models silently fall back to litellm.
 
-`create_model({name, litellm_model, subscription_model, ...})` is the factory (`name=="claude"` → `ClaudeModel`, else `GenericModel`). `main()` is a thin conductor over extracted helpers: `build_parser`, `decide_route`, `preflight_litellm`, `prepare_workdir`, `setup_pi`, `run_subscription_route` / `run_litellm_route`, `write_summary`.
+`create_model({name, litellm_model, subscription_model, ...})` is the factory (`name=="claude"` → `ClaudeModel`, else `GenericModel`). Each model owns its route decision: `model.route(prefer)` returns `"litellm"`/`"subscription"` (single source of truth, queried by `main` for the litellm key preflight and banner), and `model.run(prefer, ctx)` encapsulates the route branching and orchestration (`_run_litellm_route` / `ClaudeModel._run_subscription_route`). Per-run inputs are bundled in a `RunContext` built in `main`, so models don't touch argparse. `main()` is a thin conductor over `build_parser`, `preflight_litellm`, `prepare_workdir`, `setup_pi`, `model.run`, `write_summary`.
 
 **Attack fingerprint**: `attack_fingerprint()` stamps each run with `profile` + `prompt_sha` + `task_sha` + route-specific fields. The judge only compares runs with the **same fingerprint** — subscription (`subscription-claude`) and litellm (`litellm`) runs are never compared to each other.
 
