@@ -1,4 +1,4 @@
-name = judge_claude
+name = claude
 
 litellm_model  = openrouter/anthropic/claude-opus-4.8
 litellm_budget = 1

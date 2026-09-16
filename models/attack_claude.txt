@@ -10,7 +10,7 @@
 # обычный `claude auth login` (access живёт ~8 ч, сам не обновляется). Маршрут --
 # только для ДОВЕРЕННОГО бинаря (контейнер Claude идёт с сетью и доступом к Pi).
 
-name = attack_claude
+name = claude
 
 litellm_model  = openrouter/anthropic/claude-opus-4.8
 litellm_budget = 3
