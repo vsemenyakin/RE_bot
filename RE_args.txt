@@ -14,8 +14,12 @@ deps = samples/libonnxruntime.so samples/vehicle.onnx samples/scene.krw
 attack_models = models/attack_claude.txt
 
 # Модель-судья: путь к файлу описания (или прямое litellm-имя). Судья ходит
-# только через litellm (подписка пока не поддерживается) -- см. models/judge_claude.txt.
-judge_model = models/judge_claude.txt
+# только через litellm (подписка пока не поддерживается).
+# ЛОКАЛЬНЫЙ судья (Ollama), чтобы исходник truth/ не утекал на чужие сервера.
+# Валидация против Claude: 32B кладёт балл в пределах ~0.03 по всему диапазону,
+# включая defense-инверсию (14B промахивался на 0.10+ на защитах). ~17 мин/вызов.
+# Для облачного судьи вернуть models/judge_claude.txt (но это шлёт truth/ наружу).
+judge_model = models/judge_local32.txt
 
 # Метка версии бинаря -- по ней судья сравнивает регрессии между версиями.
 label = kerbside-0.1.0

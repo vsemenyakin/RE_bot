@@ -178,15 +178,49 @@ def build_judge_prompt(targets, source_root, reports):
     return "\n".join(lines)
 
 
+# Форма ответа судьи -- ровно то, что ждёт parse_verdicts/score. Для локальных
+# (ollama) моделей навязываем её на уровне декодинга: слабая модель на длинном
+# выводе иначе ломает синтаксис JSON (падение ~1/8 прогонов, на самых вскрытых).
+# enum по level заодно не даёт выдумать несуществующий уровень.
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "level": {"type": "string",
+                              "enum": ["revealed", "partial", "not_revealed"]},
+                    "by": {"type": "array", "items": {"type": "string"}},
+                    "cheapest_turns": {"type": ["integer", "null"]},
+                    "rationale": {"type": "string"},
+                },
+                "required": ["id", "level"],
+            },
+        }
+    },
+    "required": ["verdicts"],
+}
+
+
 def call_judge(model, prompt, max_tokens=8000):
     import litellm
     litellm.suppress_debug_info = True
-    resp = litellm.completion(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
-        temperature=0,
-    )
+    kwargs = dict(model=model, messages=[{"role": "user", "content": prompt}],
+                  max_tokens=max_tokens, temperature=0)
+    # Локальный судья (Ollama): форсим валидный JSON по схеме + поднимаем окно
+    # (промпт судьи ~14k токенов, дефолтный num_ctx Ollama обрезал бы его).
+    # Сильные облачные модели (Claude) в этом не нуждаются -- их путь не трогаем.
+    if model.startswith("ollama"):
+        import os
+        kwargs["format"] = JUDGE_SCHEMA
+        kwargs["num_ctx"] = int(os.environ.get("RE_JUDGE_NUM_CTX", "32768"))
+        # Крупные локальные модели с CPU-офлоадом легко перебирают дефолтные 600 с
+        # litellm на большом промпте. Судья оффлайновый -- даём щедрый таймаут.
+        kwargs["timeout"] = int(os.environ.get("RE_JUDGE_TIMEOUT", "3600"))
+    resp = litellm.completion(**kwargs)
     text = resp.choices[0].message.content or ""
     try:
         cost = litellm.completion_cost(completion_response=resp)
