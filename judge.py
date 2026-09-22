@@ -421,6 +421,23 @@ def main():
     print(f"[i] целей    : {len(targets['targets'])}")
     print(f"[i] атакующих: {len(reports)} -- {', '.join(reports)}")
 
+    # Судья не запускается впустую. Отчёты есть (summary.json был у каждого
+    # атакующего), но если НИ ОДИН не дал report/findings -- вскрывать нечего, а
+    # вызов судьи (на локальной модели это минуты) бессмыслен. Пишем void-запись
+    # (attack_ok:false -> вне базы сравнения) и выходим, не обращаясь к модели.
+    attack_ok = any(data["report"] or data["findings"] for data in reports.values())
+    if not attack_ok:
+        print("\n[!] НИ ОДИН атакующий не дал отчёт/находок -- атака не состоялась.")
+        print("    Судья не запускается (нечего оценивать). Частая причина -- не")
+        print("    запущен Docker: атакующие не смогли подняться.")
+        (run_dir / "resilience.json").write_text(json.dumps({
+            "binary": binary_name, "version": version, "run": run_dir.name,
+            "judged_at": datetime.now().isoformat(timespec="seconds"),
+            "attack_ok": False, "attackers": list(reports),
+            "resilience": None, "note": "attack did not run -- judge skipped",
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        sys.exit(2)
+
     prompt = build_judge_prompt(targets, source_root, reports)
 
     if args.dry_run:
@@ -460,10 +477,7 @@ def main():
 
     resilience, rows = score(targets, verdicts)
     fingerprint, attack_models = attack_fingerprint(reports)
-
-    # Состоялась ли атака: хоть один атакующий дал отчёт или находки. Если нет --
-    # балл стойкости тривиально высок (вскрывать было некому) и НЕ отражает защиту.
-    attack_ok = any(data["report"] or data["findings"] for data in reports.values())
+    # attack_ok здесь всегда True: пустую атаку отсекли выше (до вызова судьи).
 
     result = {
         "binary": binary_name,
@@ -503,10 +517,6 @@ def main():
     print("\n" + "=" * 62)
     print(f"  СТОЙКОСТЬ: {resilience}   (1.0 = ничего не вскрыто, 0.0 = вскрыто всё)")
     print("=" * 62)
-    if not attack_ok:
-        print("  [!] НИ ОДИН атакующий не дал отчёт/находок -- атака не состоялась.")
-        print("      Балл высок формально (вскрывать было некому), это НЕ замер")
-        print("      стойкости. В базу сравнения прогон не пойдёт.")
     mark = {"revealed": "ВСКРЫТО    ", "partial": "частично   ", "not_revealed": "устояло    "}
     for r in rows:
         by = (", ".join(r["by"]) or "-") if r["level"] != "not_revealed" else "-"
@@ -537,4 +547,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\n[прервано пользователем]")
