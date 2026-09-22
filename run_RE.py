@@ -44,6 +44,24 @@ def parse_args_file(path):
     return conf
 
 
+def derive_label(targets_out):
+    """Метка версии бинаря = 'name-version' из сгенерированного protected.yaml
+    (его заполняет targets_gen из Cargo.toml). Единый источник версии -- Cargo,
+    поэтому метка всегда совпадает с версией, по которой судит judge.py. Возвращает
+    '' если определить не удалось."""
+    for cand in (HERE / targets_out, Path(targets_out)):
+        if cand.is_file():
+            try:
+                import yaml
+                b = (yaml.safe_load(cand.read_text(encoding="utf-8")) or {}).get("binary", {})
+                name, ver = b.get("name"), b.get("version")
+                if name and ver is not None:
+                    return f"{name}-{ver}"
+            except Exception:
+                pass
+    return ""
+
+
 def run_step(name, cmd):
     print(f"\n{'=' * 64}\n[ЭТАП] {name}\n  {' '.join(cmd)}\n{'=' * 64}", flush=True)
     proc = subprocess.run(cmd)
@@ -89,12 +107,17 @@ def main():
     if not Path(HERE / targets_out).is_file() and not Path(targets_out).is_file():
         sys.exit(f"нет файла целей: {targets_out} -- убери --skip-targets или создай его")
 
+    # Метка версии бинаря для манифеста -- автоматически из protected.yaml (Cargo),
+    # чтобы не держать её вручную. Если label всё же задан в RE_args -- переопределяет.
+    label = conf.get("label") or derive_label(targets_out)
+
     # === ЭТАП 2: атака ансамблем ===
     # Имена ключей в файле аргументов бывают с подчёркиванием, флаги orchestrate --
     # с дефисом. Нормализуем: '_' -> '-' только в имени ключа (не в значении).
+    # label обрабатываем отдельно (берётся из Cargo), в общий проброс не идёт.
     cmd = [py, str(HERE / "orchestrate.py"), "--run-dir", str(run_dir)]
     for key, val in conf.items():
-        if key in JUDGE_KEYS:
+        if key in JUDGE_KEYS or key == "label":
             continue
         flag = "--" + key.replace("_", "-")
         if key in FLAG_KEYS:
@@ -103,6 +126,8 @@ def main():
             cmd += ["--deps"] + val.split()
         else:
             cmd += [flag, val]
+    if label:
+        cmd += ["--label", label]
     run_step("атака ансамблем (orchestrate.py)", cmd)
 
     # === ЭТАП 3: оценка судьёй ===
