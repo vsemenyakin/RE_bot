@@ -19,6 +19,7 @@
 """
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -105,8 +106,76 @@ def collect_attacker_reports(run_dir):
     return reports
 
 
-def build_judge_prompt(targets, source_root, reports):
-    """Собирает вход судьи: эталон + всё, что нашли атакующие."""
+# --- Детерминированный пре-фильтр констант --------------------------------
+# Слабый локальный судья ненадёжен в проверке "есть ли ЧИСЛО в отчёте": то не
+# замечает написанное, то выдумывает отсутствующее. Но присутствие числа -- не
+# суждение, а факт: его считает КОД, точно и без фантазий. Судье оставляем только
+# то, что он ещё тянет: привязать найденное число к нужной величине (коллизии).
+
+_HEX_RE = re.compile(r"0[xX][0-9a-fA-F]+")
+_SCI_RE = re.compile(r"\d+(?:\.\d+)?[eE][+-]?\d+")
+_NUM_RE = re.compile(r"\d[\d_,]*\.\d+|\d[\d_,]*")
+
+
+def numbers_in_text(text):
+    """Множество числовых значений (float), встречающихся в тексте как отдельные
+    числа. Hex-адреса (0x...) и научную нотацию (1e-9) убираем заранее, чтобы их
+    цифры не дробились в ложные числа. '14_600'/'14,600' нормализуются в 14600."""
+    text = _HEX_RE.sub(" ", text)
+    text = _SCI_RE.sub(" ", text)
+    nums = set()
+    for m in _NUM_RE.finditer(text):
+        tok = m.group().replace("_", "").replace(",", "")
+        try:
+            nums.add(float(tok))
+        except ValueError:
+            pass
+    return nums
+
+
+def _reports_text(reports):
+    """Весь текст находок атакующих (отчёт + re-note) одной строкой -- по нему
+    ищем присутствие значений."""
+    parts = []
+    for data in reports.values():
+        if data.get("report"):
+            parts.append(data["report"])
+        for f in data.get("findings", []):
+            t = f.get("text")
+            if t:
+                parts.append(str(t))
+    return "\n".join(parts)
+
+
+def constant_presence(targets, reports):
+    """Для каждой цели kind=constant: встречается ли её эталонное числовое значение
+    как число в отчётах атакующих (детерминированно, без LLM). {id: True/False}.
+
+    Надёжно ОТСЕКАЕТ отсутствующие значения -- судья их не увидит и не выдумает.
+    Для присутствующих это лишь КАНДИДАТ: привязку к величине и коллизии (одно
+    число у разных целей) по-прежнему решает судья. Нечисловой эталон -> True
+    (не фильтруем, отдаём судье)."""
+    nums = numbers_in_text(_reports_text(reports))
+    present = {}
+    for t in targets["targets"]:
+        if t.get("kind") != "constant":
+            continue
+        raw = str(t.get("truth", "")).replace("_", "").replace(",", "")
+        try:
+            val = float(raw)
+        except ValueError:
+            present[t["id"]] = True
+            continue
+        present[t["id"]] = any(abs(n - val) <= 1e-9 * max(1.0, abs(val)) for n in nums)
+    return present
+
+
+def build_judge_prompt(targets, source_root, reports, present=None):
+    """Собирает вход судьи: эталон + всё, что нашли атакующие. present -- карта
+    {id: bool} автопроверки присутствия значений констант (constant_presence);
+    если None, считается здесь же."""
+    if present is None:
+        present = constant_presence(targets, reports)
     lines = [
         "Ты оцениваешь СТОЙКОСТЬ бинаря к реверс-инжинирингу.",
         "",
@@ -140,6 +209,20 @@ def build_judge_prompt(targets, source_root, reports):
         "если механизм опознан -- это partial. reveal_criteria цели лишь уточняют границу",
         "между partial и revealed, но не отменяют пол.",
         "",
+        "ВАЖНО про цели kind=constant (числовые секреты). У каждой в эталоне есть",
+        "точное значение, и рядом стоит АВТОПРОВЕРКА присутствия этого числа в отчётах",
+        "(её сделал КОД, не ты) -- доверяй ей как факту:",
+        "  'НЕ НАЙДЕНО' -> числа в отчёте нет => not_revealed. НЕ выдумывай совпадение.",
+        "  'НАЙДЕНО'    -> число где-то есть, но это лишь КАНДИДАТ. Реши по смыслу/",
+        "                  контексту: относится ли оно ИМЕННО к этой величине =>",
+        "                  revealed; если это случайное совпадение или число описывает",
+        "                  ДРУГУЮ величину => not_revealed.",
+        "  partial      -- величина опознана по смыслу, но точного значения нет.",
+        "ОСТОРОЖНО с коллизиями: одно и то же число бывает у РАЗНЫХ целей (напр. 0.34",
+        "у двух). Засчитывай той, к которой оно привязано по смыслу, а не всем подряд.",
+        "Имя переменной НЕ важно (атакующий не знал имён из эталона) -- важно ЧИСЛО и",
+        "что оно относится к той же величине.",
+        "",
         "=" * 70,
         "ЦЕЛИ ЗАЩИТЫ (ЭТАЛОН -- у тебя, у атакующих этого не было):",
         "=" * 70,
@@ -149,6 +232,9 @@ def build_judge_prompt(targets, source_root, reports):
         lines.append(f"Роль в защите: {t.get('role','')}")
         if t.get("kind") == "constant":
             lines.append(f"Эталонное значение: {t.get('truth')}")
+            found = present.get(t["id"], True)
+            lines.append(f"АВТОПРОВЕРКА присутствия значения в отчётах: "
+                         f"{'НАЙДЕНО' if found else 'НЕ НАЙДЕНО'}")
         if t.get("truth_ref"):
             code = resolve_truth_ref(source_root, t["truth_ref"])
             lines.append(f"Эталонный исходник ({t['truth_ref']}):\n```\n{code}\n```")
@@ -281,11 +367,16 @@ def parse_verdicts(text):
     return json.loads(t)
 
 
-def score(targets, verdicts):
+def score(targets, verdicts, present=None):
     """Балл стойкости: чем МЕНЬШЕ вскрыто, тем ВЫШЕ стойкость.
 
     Считаем долю защищённого от максимума. 1.0 = ничего не вскрыто (идеальная
     стойкость), 0.0 = вскрыто всё. Веса целей учитываются.
+
+    present -- карта {id: bool} автопроверки констант. Если у константы значения в
+    отчёте НЕТ (present=False), вскрытия быть не может: любой revealed/partial от
+    судьи отменяем в not_revealed. Детерминированная защита от галлюцинаций слабого
+    судьи -- присутствие числа проверяет код, а не модель.
     """
     by_id = {v["id"]: v for v in verdicts.get("verdicts", [])}
     max_w = 0
@@ -295,14 +386,19 @@ def score(targets, verdicts):
         w = WEIGHTS.get(t.get("weight", "medium"), 2)
         max_w += w * LEVELS["revealed"]
         v = by_id.get(t["id"], {"level": "not_revealed"})
-        lv = LEVELS.get(v.get("level", "not_revealed"), 0)
-        lost += w * lv
+        level = v.get("level", "not_revealed")
+        by = v.get("by", [])
+        cheapest = v.get("cheapest_turns")
+        rationale = v.get("rationale", "")
+        if (present is not None and t.get("kind") == "constant"
+                and present.get(t["id"]) is False and level != "not_revealed"):
+            level, by, cheapest = "not_revealed", [], None
+            rationale = "[автопроверка: значения нет в отчёте] " + rationale
+        lost += w * LEVELS.get(level, 0)
         rows.append({
             "id": t["id"], "weight": t.get("weight", "medium"),
-            "level": v.get("level", "not_revealed"),
-            "by": v.get("by", []),
-            "cheapest_turns": v.get("cheapest_turns"),
-            "rationale": v.get("rationale", ""),
+            "level": level, "by": by,
+            "cheapest_turns": cheapest, "rationale": rationale,
         })
     resilience = round(1 - lost / max_w, 3) if max_w else None
     return resilience, rows
@@ -444,7 +540,16 @@ def main():
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         sys.exit(2)
 
-    prompt = build_judge_prompt(targets, source_root, reports)
+    # Детерминированный пре-фильтр констант: считаем присутствие значений ОДИН раз,
+    # используем и в промпте (пометка судье), и в скоринге (жёсткое отсечение).
+    present = constant_presence(targets, reports)
+    n_const = len(present)
+    n_absent = sum(1 for v in present.values() if v is False)
+    if n_const:
+        print(f"[i] пре-фильтр: констант {n_const}, значение НЕ найдено в отчётах у "
+              f"{n_absent} (авто -> not_revealed), кандидатов судье {n_const - n_absent}")
+
+    prompt = build_judge_prompt(targets, source_root, reports, present)
 
     if args.dry_run:
         out = run_dir / "judge_prompt.txt"
@@ -481,7 +586,7 @@ def main():
     except (json.JSONDecodeError, ValueError) as exc:
         sys.exit(f"не разобрал ответ судьи как JSON: {exc}\nсырой ответ в {run_dir}/judge_raw.txt")
 
-    resilience, rows = score(targets, verdicts)
+    resilience, rows = score(targets, verdicts, present)
     fingerprint, attack_models = attack_fingerprint(reports)
     # attack_ok здесь всегда True: пустую атаку отсекли выше (до вызова судьи).
 
