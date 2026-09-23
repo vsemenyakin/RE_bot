@@ -299,19 +299,30 @@ JUDGE_SCHEMA = {
 
 def call_judge(model, prompt, max_tokens=8000):
     import litellm
+    import os
     litellm.suppress_debug_info = True
     kwargs = dict(model=model, messages=[{"role": "user", "content": prompt}],
                   max_tokens=max_tokens, temperature=0)
-    # Локальный судья (Ollama): форсим валидный JSON по схеме + поднимаем окно
-    # (промпт судьи ~14k токенов, дефолтный num_ctx Ollama обрезал бы его).
-    # Сильные облачные модели (Claude) в этом не нуждаются -- их путь не трогаем.
+    # Локальный судья (Ollama). Промпт ~15k токенов -> поднимаем num_ctx (дефолт
+    # Ollama 4096 обрезал бы его) и таймаут (32B на CPU-офлоаде перебирает 600 с
+    # litellm). Сильные облачные модели (Claude) в этом не нуждаются -- их не трогаем.
     if model.startswith("ollama"):
-        import os
-        kwargs["format"] = JUDGE_SCHEMA
-        kwargs["num_ctx"] = int(os.environ.get("RE_JUDGE_NUM_CTX", "32768"))
-        # Крупные локальные модели с CPU-офлоадом легко перебирают дефолтные 600 с
-        # litellm на большом промпте. Судья оффлайновый -- даём щедрый таймаут.
+        # thinking-модели (qwen3) дают рассуждение в <think>...</think> ПЕРЕД
+        # ответом -- ради него мы их и берём (дискриминация коллизий). Жёсткая
+        # JSON-схема задушила бы это рассуждение, поэтому схему НЕ форсим (JSON
+        # достаём из хвоста в parse_verdicts), а окно и лимит вывода расширяем:
+        # reasoning ест токены, и prompt+think+ответ обязаны влезть в num_ctx.
+        thinking = "qwen3" in model.lower()
+        kwargs["num_ctx"] = int(os.environ.get(
+            "RE_JUDGE_NUM_CTX", "40960" if thinking else "32768"))
         kwargs["timeout"] = int(os.environ.get("RE_JUDGE_TIMEOUT", "3600"))
+        if thinking:
+            kwargs["max_tokens"] = int(os.environ.get(
+                "RE_JUDGE_MAX_TOKENS", str(max(max_tokens, 16000))))
+        else:
+            # Слабая нерассуждающая модель на длинном выводе ломает JSON
+            # (падало ~1/8 прогонов) -- навязываем форму на уровне декодинга.
+            kwargs["format"] = JUDGE_SCHEMA
     resp = litellm.completion(**kwargs)
     text = resp.choices[0].message.content or ""
     try:
@@ -353,10 +364,15 @@ def estimate_judge_cost(model, prompt, max_tokens):
 
 
 def parse_verdicts(text):
-    """Достаёт JSON из ответа судьи, даже если он обёрнут в ```json ... ```."""
+    """Достаёт JSON из ответа судьи, даже если он обёрнут в ```json ... ``` или
+    предварён рассуждением thinking-модели в <think>...</think>."""
     t = text.strip()
+    # thinking-модели (qwen3) выдают рассуждение в <think>...</think> перед ответом.
+    # Убираем его, чтобы фигурные скобки из рассуждения не путали разбор JSON;
+    # второй проход страхует от оборванного/незакрытого блока.
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.S).strip()
+    t = re.sub(r"^.*</think>", "", t, flags=re.S).strip()
     if "```" in t:
-        import re
         m = re.search(r"```(?:json)?\s*(.+?)```", t, re.S)
         if m:
             t = m.group(1).strip()
