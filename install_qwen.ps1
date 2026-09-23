@@ -18,7 +18,7 @@ it ASCII lets it run correctly regardless of how it is read.
 #>
 [CmdletBinding()]
 param(
-    [string]$Model     = "qwen2.5:32b",
+    [string]$Model     = "qwen3:30b",
     [int]   $MinFreeGB = 22          # 32b is ~18.5 GB; leave headroom. Lower for 14b.
 )
 $ErrorActionPreference = "Stop"
