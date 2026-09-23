@@ -8,7 +8,8 @@ Each step is idempotent (safe to re-run):
   3. Verify the model answers  -- runs a trivial prompt and checks for a reply.
 
 Run (from the repo root):
-  powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1
+  powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1                          # qwen3:30b (default)
+  powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1 -Model qwen3:30b         # same, explicit
   powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1 -Model qwen2.5:14b -MinFreeGB 12
 
 NOTE: this file is intentionally ASCII-only and has no BOM. Windows PowerShell 5.1
@@ -19,7 +20,7 @@ it ASCII lets it run correctly regardless of how it is read.
 [CmdletBinding()]
 param(
     [string]$Model     = "qwen3:30b",
-    [int]   $MinFreeGB = 22          # 32b is ~18.5 GB; leave headroom. Lower for 14b.
+    [int]   $MinFreeGB = 22          # qwen3:30b / qwen2.5:32b ~19 GB; leave headroom. Lower for 14b.
 )
 $ErrorActionPreference = "Stop"
 
@@ -83,7 +84,7 @@ if ($present -contains $Model) {
         }
     }
 
-    Write-Host "[i] Pulling '$Model' -- this can take a while (32b ~ 18.5 GB) ..."
+    Write-Host "[i] Pulling '$Model' -- this can take a while (multi-GB download) ..."
     ollama pull $Model
     if ($LASTEXITCODE -ne 0) { throw "ollama pull '$Model' failed (exit code $LASTEXITCODE)." }
     Write-Host "[+] Model '$Model' pulled."
@@ -98,6 +99,14 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($reply)) {
 $firstLine = ($reply.Trim() -split "`r?`n")[0]
 Write-Host "[+] Model answered: $firstLine"
 Write-Host ""
+
+# Point the user at the matching judge descriptor for the model actually pulled.
+switch -Wildcard ($Model) {
+    "qwen3:*"     { $desc = "models/judge_local_qwen3.txt" }
+    "qwen2.5:32b" { $desc = "models/judge_local32.txt" }
+    "qwen2.5:14b" { $desc = "models/judge_local.txt" }
+    default       { $desc = "models/<your description>.txt" }
+}
 Write-Host "[+] Done. '$Model' is installed and working."
-Write-Host "    Point the judge at it in RE_args.txt: judge_model = models/judge_local32.txt"
+Write-Host "    Point the judge at it in RE_args.txt: judge_model = $desc"
 Write-Host "    (that description uses litellm_model = ollama_chat/$Model)"

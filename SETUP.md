@@ -38,23 +38,38 @@ powershell .\build.ps1
 и проверяет её ответ:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1
+powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1 -Model qwen3:30b
 ```
 
-Ставит **Qwen2.5-32B** (~18.5 ГБ на диске); её описание — `models/judge_local32.txt`,
-на которое `judge_model` в `RE_args.txt` уже настроен по умолчанию. Скрипт
-идемпотентен: повторный запуск пропустит уже сделанное. Для более лёгкой модели
-(быстрее, но менее строгой на защитах):
+Ставит **Qwen3-30B** (~19 ГБ; MoE — 30 млрд параметров, но активны ~3 млрд на
+токен, плюс режим рассуждения). Её описание — `models/judge_local_qwen3.txt`, на
+которое `judge_model` в `RE_args.txt` настроен по умолчанию. Скрипт идемпотентен:
+повторный запуск пропустит уже сделанное.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1 -Model qwen2.5:14b -MinFreeGB 12
-```
-и укажи `judge_model = models/judge_local.txt`.
+Почему именно она: судья по числовым константам должен не просто найти значение в
+отчёте, а привязать его к нужной величине и отсеять случайные совпадения (одно
+число бывает у разных целей). Это дискриминация, где слабые модели штампуют «да»;
+режим рассуждения qwen3 её вытягивает, а MoE держит скорость. Плюс `judge.py`
+делает детерминированный **пре-фильтр**: присутствие числа проверяет код (греп по
+значениям), а модели остаётся только привязка — так галлюцинации о ненайденных
+константах невозможны в принципе.
 
 Требования: желательна NVIDIA-видеокарта, свободное место под модель и терпение —
-на 32B один вызов судьи ~15–20 мин (оффлайн, после атаки это не критично; тонко
-настраивается через `RE_JUDGE_NUM_CTX`/`RE_JUDGE_TIMEOUT`). Судья ходит только
-через litellm и видит Ollama как `ollama_chat/…` без правок кода.
+один вызов судьи ~9–15 мин (оффлайн, после атаки не критично; тонко настраивается
+через `RE_JUDGE_NUM_CTX` / `RE_JUDGE_TIMEOUT` / `RE_JUDGE_MAX_TOKENS`). Судья ходит
+только через litellm и видит Ollama как `ollama_chat/…` без правок кода.
+
+Альтернативы (нужно и поменять `judge_model` в `RE_args.txt` на соответствующее
+описание):
+
+```powershell
+# qwen2.5:32b -- без рассуждения, медленнее, слабее на высокой вскрываемости
+powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1 -Model qwen2.5:32b
+#   -> judge_model = models/judge_local32.txt
+# qwen2.5:14b -- легче и быстрее, но заметно слабее на защитах (defense-инверсия)
+powershell -ExecutionPolicy Bypass -File .\install_qwen.ps1 -Model qwen2.5:14b -MinFreeGB 12
+#   -> judge_model = models/judge_local.txt
+```
 
 Пропустить шаг = облачный судья: верни `judge_model = models/judge_claude.txt`
 (но тогда `truth/` уходит на чужой сервер).
