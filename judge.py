@@ -554,13 +554,18 @@ def run_is_valid(resilience_data, run_path):
     return False
 
 
-def find_previous(run_dir, binary_name, fingerprint):
+def find_previous(run_dir, binary_name, fingerprint, judge_model):
     """Ищет прошлые ВАЛИДНЫЕ замеры того же бинаря, разделяя их по сопоставимости.
 
     Возвращает (comparable, incomparable):
-      comparable   -- замеры С ТЕМ ЖЕ отпечатком атаки (дельту считать можно);
-      incomparable -- замеры с другим отпечатком (разной атакой -- дельту нельзя).
+      comparable   -- замеры С ТЕМ ЖЕ отпечатком атаки И ТЕМ ЖЕ судьёй (дельту можно);
+      incomparable -- всё прочее; каждый помечен причиной в '_incomparable_reason'.
     Провальные прогоны (см. run_is_valid) отбрасываются из обоих списков.
+
+    Балл стойкости зависит от ДВУХ вещей: силы атаки и того, КТО судил. Разные
+    судьи дают разный систематический сдвиг (напр. штампующий 32B против reasoning
+    qwen3), и разница между ними -- не регрессия защищённости, а смена измерителя.
+    Поэтому сравниваем только одинаковую атаку у одинакового судьи.
     """
     comparable, incomparable = [], []
     for f in sorted(RUNS.glob("*/resilience.json")):
@@ -574,9 +579,17 @@ def find_previous(run_dir, binary_name, fingerprint):
             continue
         if not run_is_valid(d, f.parent):
             continue
-        if d.get("attack_fingerprint") == fingerprint:
+        same_attack = d.get("attack_fingerprint") == fingerprint
+        same_judge = d.get("judge_model") == judge_model
+        if same_attack and same_judge:
             comparable.append(d)
         else:
+            if not same_attack and not same_judge:
+                d["_incomparable_reason"] = "другая атака и другой судья"
+            elif not same_attack:
+                d["_incomparable_reason"] = "другая атака"
+            else:
+                d["_incomparable_reason"] = "другой судья"
             incomparable.append(d)
     return comparable, incomparable
 
@@ -714,7 +727,7 @@ def main():
     # замерами (одинаковая атака). Провальный текущий прогон ни с чем не сравниваем.
     comparable, incomparable = ([], [])
     if attack_ok:
-        comparable, incomparable = find_previous(run_dir, binary_name, fingerprint)
+        comparable, incomparable = find_previous(run_dir, binary_name, fingerprint, judge_model)
     comparable = [d for d in comparable if d.get("resilience") is not None]
     if comparable and resilience is not None:
         prev = comparable[-1]  # самый свежий сопоставимый
@@ -723,7 +736,8 @@ def main():
                               "resilience": prev["resilience"], "same_version": same_version}
         result["delta"] = round(resilience - prev["resilience"], 3)
     result["incomparable_runs"] = [
-        {"version": d.get("version"), "run": d.get("run"), "resilience": d.get("resilience")}
+        {"version": d.get("version"), "run": d.get("run"), "resilience": d.get("resilience"),
+         "judge_model": d.get("judge_model"), "reason": d.get("_incomparable_reason")}
         for d in incomparable]
 
     (run_dir / "resilience.json").write_text(
@@ -753,10 +767,11 @@ def main():
                   f"дельта {d:+} — стойкость {arrow}")
     elif result["incomparable_runs"]:
         print(f"\n  прошлые замеры этого бинаря есть ({len(result['incomparable_runs'])}), "
-              f"но с ДРУГОЙ конфигурацией атаки — дельта не считается (несопоставимо):")
+              f"но НЕсопоставимы — дельта не считается:")
         for r in result["incomparable_runs"][-3:]:
-            print(f"    v{r['version']} / {r['run']}: стойкость {r['resilience']}")
-        print("  Для сравнения версий повтори атаку той же конфигурацией (модели/промпт/бюджет).")
+            print(f"    v{r['version']} / {r['run']}: стойкость {r['resilience']}  "
+                  f"({r.get('reason', '?')})")
+        print("  Сопоставимы только замеры с той же атакой (модели/промпт/бюджет) И тем же судьёй.")
     else:
         print(f"\n  первый замер этой конфигурации — точка отсчёта для будущих сравнений")
     print(f"\n  подробно: {run_dir / 'resilience.json'}")
