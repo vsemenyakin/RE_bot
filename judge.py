@@ -297,6 +297,90 @@ JUDGE_SCHEMA = {
 }
 
 
+def _ollama_api_base():
+    """База API Ollama: OLLAMA_API_BASE / OLLAMA_HOST, иначе локальный дефолт."""
+    import os
+    base = (os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_HOST")
+            or "http://localhost:11434")
+    if not base.startswith("http"):
+        base = "http://" + base
+    return base.rstrip("/")
+
+
+def _ollama_tags(base, timeout=3):
+    """Список имён моделей на сервере Ollama, или None если сервер недоступен."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(base + "/api/tags", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return [m.get("name", "") for m in data.get("models", [])]
+    except Exception:
+        return None
+
+
+def ensure_ollama_ready(model):
+    """Перед вызовом ЛОКАЛЬНОГО судьи: поднять сервер Ollama, если он не отвечает,
+    и убедиться, что нужная модель скачана. Понятные сообщения вместо простыни
+    трейсбека (частый случай -- после ребута служба Ollama не поднялась). Для
+    не-ollama судей (Claude и т.п.) не делает ничего."""
+    if not model.startswith("ollama"):
+        return
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+    tag = model.split("/", 1)[1] if "/" in model else model  # ollama_chat/qwen3:30b -> qwen3:30b
+    base = _ollama_api_base()
+
+    names = _ollama_tags(base)
+    if names is None:
+        # Сервер не отвечает -> пытаемся поднять `ollama serve` сами.
+        if not shutil.which("ollama"):
+            sys.exit(f"[!] Ollama не отвечает на {base}, а CLI 'ollama' не найден в PATH. "
+                     f"Установи Ollama (см. install_qwen.ps1) и запусти снова.")
+        print(f"[i] Ollama не отвечает на {base} -- поднимаю 'ollama serve' ...")
+        # Вывод serve пишем в лог-файл (НЕ в DEVNULL): если сервер не поднимется,
+        # покажем настоящую причину (частая -- 'bind: ... only one usage', порт
+        # держит зависший ollama.exe), а не молчаливый таймаут.
+        log_path = Path(tempfile.gettempdir()) / "ollama_serve_judge.log"
+        try:
+            logf = open(log_path, "w", encoding="utf-8", errors="replace")
+            proc = subprocess.Popen(["ollama", "serve"], stdout=logf,
+                                    stderr=subprocess.STDOUT)
+        except Exception as exc:
+            sys.exit(f"[!] не удалось запустить 'ollama serve': {exc}")
+        for _ in range(30):  # ждём поднятия сервера до ~60 c
+            time.sleep(2)
+            names = _ollama_tags(base)
+            if names is not None:
+                break
+        try:
+            logf.flush()
+            logf.close()
+        except Exception:
+            pass
+        if names is None:
+            rc = proc.poll()
+            state = f"процесс завершился, код {rc}" if rc is not None else "процесс ещё жив"
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace").strip()[-1500:]
+            except Exception:
+                tail = "(лог недоступен)"
+            sys.exit(f"[!] 'ollama serve' не поднял сервер на {base} за ~60 c ({state}).\n"
+                     f"    --- вывод ollama serve ---\n{tail or '(пусто)'}\n"
+                     f"    --------------------------\n"
+                     f"    Подними 'ollama serve' в отдельном терминале и посмотри ошибку. "
+                     f"Частая причина -- порт держит зависший ollama.exe (taskkill /F /IM "
+                     f"ollama.exe) или уже запущено приложение Ollama.")
+        print("[+] Ollama сервер поднят.")
+
+    if tag not in names:
+        avail = ", ".join(sorted(n for n in names if n)) or "(пусто)"
+        sys.exit(f"[!] модель '{tag}' не установлена в Ollama. Доступны: {avail}\n"
+                 f"    Скачай её:  ollama pull {tag}   (или install_qwen.ps1 -Model {tag})")
+    print(f"[i] Ollama готов: сервер {base}, модель '{tag}' на месте.")
+
+
 def call_judge(model, prompt, max_tokens=8000):
     import litellm
     import os
@@ -576,6 +660,11 @@ def main():
 
     judge_model, judge_budget = resolve_judge(args.judge)
     print(f"[i] судья    : {judge_model}")
+
+    # Локальный судья (Ollama): убедиться, что сервер поднят (после ребута служба
+    # часто не стартует сама) и модель скачана -- иначе понятное сообщение вместо
+    # простыни httpx/litellm. Для облачного судьи -- no-op.
+    ensure_ollama_ready(judge_model)
 
     # Бюджет судьи -- предохранитель ДО единственного вызова (не стоп по ходу, как
     # у атакующих: обрывать нечего). Оценка дороже потолка -> отказ; цену узнать
