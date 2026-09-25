@@ -243,6 +243,13 @@ def collect(source_root, getter_macros=GETTER_MACROS):
                 t["role"] = role
             if reveal:
                 t["reveal_criteria"] = reveal
+            # ignore-for="dev,mixed" -- конфигурации сборки, где этой цели в бинаре
+            # нет (напр. защита выключена фичей). Транзитное поле '_ignore_for':
+            # используется для фильтра в main() и НЕ пишется в protected.yaml.
+            ig = opts.get("ignore-for")
+            if ig:
+                t["_ignore_for"] = [c.strip() for c in ig.strip('"').strip("'").split(",")
+                                    if c.strip()]
 
             if kind == "constant":
                 name, value, vline = const_name_and_value(lines, i + 1, getter)
@@ -326,6 +333,9 @@ def main():
     ap.add_argument("--cargo", default=None, help="Cargo.toml, откуда взять name/version бинаря")
     ap.add_argument("--getter-macros", default=",".join(GETTER_MACROS),
                     help="макросы констант-геттеров через запятую (по умолчанию encf,enci)")
+    ap.add_argument("--build-configuration", default="",
+                    help="конфигурация сборки бинаря (dev/mixed/ship/...). Цели с "
+                         "ignore-for, содержащим это имя, исключаются. Пусто -> все цели.")
     args = ap.parse_args()
 
     src = Path(args.source).resolve()
@@ -340,11 +350,32 @@ def main():
     if args.cargo:
         merge_cargo(doc, args.cargo)
 
+    # Фильтр по конфигурации сборки: выбрасываем цели, у которых текущая
+    # конфигурация перечислена в ignore-for (напр. защита, вырезанная фичей в dev).
+    # Пустая конфигурация -> не фильтруем (обратная совместимость). Транзитное
+    # поле _ignore_for убираем из всех целей, чтобы оно не попало в protected.yaml.
+    build_config = (args.build_configuration or "").strip()
+    if build_config:
+        doc["build_configuration"] = build_config
+    kept, skipped = [], []
+    for t in doc["targets"]:
+        ig = t.pop("_ignore_for", None)
+        if build_config and ig and build_config in ig:
+            skipped.append(t)
+        else:
+            kept.append(t)
+    doc["targets"] = kept
+
+    cfg_note = f", сборка {build_config}" if build_config else ""
     print(f"[i] целей: {len(doc['targets'])} "
-          f"(бинарь {doc['binary']['name']} v{doc['binary']['version']})")
+          f"(бинарь {doc['binary']['name']} v{doc['binary']['version']}{cfg_note})")
     for t in doc["targets"]:
         extra = t.get("truth") if t["kind"] == "constant" else t.get("truth_ref")
         print(f"    [{t['weight']:<6}] {t['kind']:<10} {str(t.get('id')):<24} {extra}")
+    if skipped:
+        print(f"[i] исключено для сборки '{build_config}' (ignore-for): {len(skipped)}")
+        for t in skipped:
+            print(f"    [skip  ] {t['kind']:<10} {str(t.get('id'))}")
 
     if problems:
         print("\n[!] проблемы разметки:")

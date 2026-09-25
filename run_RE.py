@@ -23,8 +23,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 # Ключи из RE_args, относящиеся к эталону/судье, а не к атаке: в orchestrate не
-# идут (judge_model уходит в judge.py, остальные -- в targets_gen/judge).
-JUDGE_KEYS = {"source", "targets-out", "cargo", "judge_model"}
+# идут (judge_model уходит в judge.py, build-configuration -- в targets_gen,
+# остальные -- в targets_gen/judge).
+JUDGE_KEYS = {"source", "targets-out", "cargo", "judge_model",
+              "build-configuration", "build_configuration"}
 FLAG_KEYS = {"no-pi"}  # ключи-флаги без значения
 
 
@@ -91,6 +93,9 @@ def main():
     source = conf.get("source", "truth")
     targets_out = conf.get("targets-out", "truth/protected.yaml")
     cargo = conf.get("cargo")
+    # Конфигурация сборки: какой билд бинаря в samples/. Управляет, какие цели с
+    # ignore-for попадут в protected.yaml (targets_gen), и входит в сравнимость (judge).
+    build_config = conf.get("build-configuration") or conf.get("build_configuration")
 
     # --- имя прогона: задаём сами, чтобы знать путь для судьи ---
     run_name = "ens_" + datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -101,6 +106,8 @@ def main():
         cmd = [py, str(HERE / "targets_gen.py"), "--source", source, "--out", targets_out]
         if cargo:
             cmd += ["--cargo", cargo]
+        if build_config:
+            cmd += ["--build-configuration", build_config]
         run_step("генерация целей (targets_gen.py)", cmd)
     else:
         print("[i] --skip-targets: targets.yaml не пересобирается")

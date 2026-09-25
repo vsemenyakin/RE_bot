@@ -554,7 +554,7 @@ def run_is_valid(resilience_data, run_path):
     return False
 
 
-def find_previous(run_dir, binary_name, fingerprint, judge_model):
+def find_previous(run_dir, binary_name, fingerprint, judge_model, build_config):
     """Ищет прошлые ВАЛИДНЫЕ замеры того же бинаря, разделяя их по сопоставимости.
 
     Возвращает (comparable, incomparable):
@@ -562,12 +562,13 @@ def find_previous(run_dir, binary_name, fingerprint, judge_model):
       incomparable -- всё прочее; каждый помечен причиной в '_incomparable_reason'.
     Провальные прогоны (см. run_is_valid) отбрасываются из обоих списков.
 
-    Балл стойкости зависит от ДВУХ вещей: силы атаки и того, КТО судил. Разные
-    судьи дают разный систематический сдвиг (напр. штампующий 32B против reasoning
-    qwen3), и разница между ними -- не регрессия защищённости, а смена измерителя.
-    Поэтому сравниваем только одинаковую атаку у одинакового судьи.
+    Балл стойкости зависит от ТРЁХ вещей: силы атаки, того КТО судил и КОНФИГУРАЦИИ
+    сборки (у dev/ship разный набор целей -- в мягком билде защит нет). Разница по
+    любой оси -- не регрессия защищённости, а другое измерение. Пустая/отсутствующая
+    конфигурация нормализуется к "" (старые прогоны без поля сравнимы между собой).
     """
     comparable, incomparable = [], []
+    cur_cfg = build_config or ""
     for f in sorted(RUNS.glob("*/resilience.json")):
         if f.parent == run_dir:
             continue
@@ -581,15 +582,18 @@ def find_previous(run_dir, binary_name, fingerprint, judge_model):
             continue
         same_attack = d.get("attack_fingerprint") == fingerprint
         same_judge = d.get("judge_model") == judge_model
-        if same_attack and same_judge:
+        same_config = (d.get("build_configuration") or "") == cur_cfg
+        if same_attack and same_judge and same_config:
             comparable.append(d)
         else:
-            if not same_attack and not same_judge:
-                d["_incomparable_reason"] = "другая атака и другой судья"
-            elif not same_attack:
-                d["_incomparable_reason"] = "другая атака"
-            else:
-                d["_incomparable_reason"] = "другой судья"
+            reasons = []
+            if not same_attack:
+                reasons.append("другая атака")
+            if not same_judge:
+                reasons.append("другой судья")
+            if not same_config:
+                reasons.append("другая конфигурация сборки")
+            d["_incomparable_reason"] = " и ".join(reasons)
             incomparable.append(d)
     return comparable, incomparable
 
@@ -628,11 +632,13 @@ def main():
     targets = load_targets(targets_path)
     binary_name = targets.get("binary", {}).get("name", run_dir.name)
     version = targets.get("binary", {}).get("version", "?")
+    build_configuration = targets.get("build_configuration") or ""
 
     reports = collect_attacker_reports(run_dir)
     if not reports:
         sys.exit(f"в {run_dir} нет отчётов атакующих (summary.json не найдены)")
-    print(f"[i] бинарь   : {binary_name} v{version}")
+    cfg_note = f" (сборка: {build_configuration})" if build_configuration else ""
+    print(f"[i] бинарь   : {binary_name} v{version}{cfg_note}")
     print(f"[i] целей    : {len(targets['targets'])}")
     print(f"[i] атакующих: {len(reports)} -- {', '.join(reports)}")
 
@@ -719,6 +725,7 @@ def main():
         "attack_ok": attack_ok,
         "attack_fingerprint": fingerprint,
         "attack_models": attack_models,
+        "build_configuration": build_configuration,
         "resilience": resilience,
         "targets": rows,
     }
@@ -727,7 +734,8 @@ def main():
     # замерами (одинаковая атака). Провальный текущий прогон ни с чем не сравниваем.
     comparable, incomparable = ([], [])
     if attack_ok:
-        comparable, incomparable = find_previous(run_dir, binary_name, fingerprint, judge_model)
+        comparable, incomparable = find_previous(
+            run_dir, binary_name, fingerprint, judge_model, build_configuration)
     comparable = [d for d in comparable if d.get("resilience") is not None]
     if comparable and resilience is not None:
         prev = comparable[-1]  # самый свежий сопоставимый
