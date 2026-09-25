@@ -22,7 +22,7 @@ attack_models = models/attack_claude.txt
 #   коллизий, JSON-схему для неё не форсим (см. judge.py call_judge).
 # Прежний вариант -- models/judge_local32.txt (qwen2.5:32b, без reasoning, медленнее).
 # Для облачного судьи вернуть models/judge_claude.txt (но это шлёт truth/ наружу).
-judge_model = models/judge_local_qwen3.txt
+judge_model = models/judge_claude.txt
 
 # Метка версии бинаря (name-version) формируется АВТОМАТИЧЕСКИ из truth/Cargo.toml
 # (через сгенерированный protected.yaml) -- вручную задавать не нужно. При желании

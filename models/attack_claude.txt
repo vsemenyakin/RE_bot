@@ -13,11 +13,11 @@
 name = claude
 
 litellm_model  = openrouter/anthropic/claude-opus-4.8
-litellm_budget = 3
+litellm_budget = 1
 
 # subscription_model -- имя для claude -p --model. Алиас "opus" = свежайший Opus.
 # ~75%% окна Opus в Pro ≈ 10 (API-эквивалент), с запасом до session limit.
 subscription_model  = opus
 subscription_budget = 5
 
-preferred_run_type = subscription
+preferred_run_type = litellm
