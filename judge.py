@@ -554,21 +554,28 @@ def run_is_valid(resilience_data, run_path):
     return False
 
 
-def find_previous(run_dir, binary_name, fingerprint, judge_model, build_config):
+def find_previous(run_dir, binary_name, fingerprint, judge_model, build_config,
+                  version, sample_sha256):
     """Ищет прошлые ВАЛИДНЫЕ замеры того же бинаря, разделяя их по сопоставимости.
 
     Возвращает (comparable, incomparable):
-      comparable   -- замеры С ТЕМ ЖЕ отпечатком атаки И ТЕМ ЖЕ судьёй (дельту можно);
+      comparable   -- замеры той же атаки/судьи/конфигурации, пригодные в базу;
       incomparable -- всё прочее; каждый помечен причиной в '_incomparable_reason'.
     Провальные прогоны (см. run_is_valid) отбрасываются из обоих списков.
 
-    Балл стойкости зависит от ТРЁХ вещей: силы атаки, того КТО судил и КОНФИГУРАЦИИ
-    сборки (у dev/ship разный набор целей -- в мягком билде защит нет). Разница по
-    любой оси -- не регрессия защищённости, а другое измерение. Пустая/отсутствующая
-    конфигурация нормализуется к "" (старые прогоны без поля сравнимы между собой).
+    Балл зависит от силы атаки, того КТО судил и КОНФИГУРАЦИИ сборки -- это must-match
+    (разница по любой оси = другое измерение). Нормализация пустых -> "" (старые
+    прогоны без полей сравнимы между собой).
+
+    ВЕРСИЯ -- ось регрессии, НЕ must-match: разные версии СРАВНИВАЮТСЯ (это и есть
+    регрессия), хеш бинаря при этом закономерно иной. А вот ОДНА версия с РАЗНЫМ
+    хешем бинаря -- это подмена/забыли бампнуть (напр. мягкий vs хардёный под одной
+    меткой): не "разброс", а другой бинарь -> несопоставимо. Проверяем только когда
+    оба хеша известны (иначе обратная совместимость со старыми прогонами без хеша).
     """
     comparable, incomparable = [], []
     cur_cfg = build_config or ""
+    cur_sha = sample_sha256 or ""
     for f in sorted(RUNS.glob("*/resilience.json")):
         if f.parent == run_dir:
             continue
@@ -583,7 +590,12 @@ def find_previous(run_dir, binary_name, fingerprint, judge_model, build_config):
         same_attack = d.get("attack_fingerprint") == fingerprint
         same_judge = d.get("judge_model") == judge_model
         same_config = (d.get("build_configuration") or "") == cur_cfg
-        if same_attack and same_judge and same_config:
+        # "Та же версия, но другой бинарь": оба хеша известны, версия совпадает,
+        # а хеши разные -> подмена под одной меткой, в базу не пускаем.
+        prev_sha = d.get("sample_sha256") or ""
+        mislabeled = (d.get("version") == version and cur_sha and prev_sha
+                      and prev_sha != cur_sha)
+        if same_attack and same_judge and same_config and not mislabeled:
             comparable.append(d)
         else:
             reasons = []
@@ -593,6 +605,8 @@ def find_previous(run_dir, binary_name, fingerprint, judge_model, build_config):
                 reasons.append("другой судья")
             if not same_config:
                 reasons.append("другая конфигурация сборки")
+            if mislabeled:
+                reasons.append("та же версия, другой бинарь (hash)")
             d["_incomparable_reason"] = " и ".join(reasons)
             incomparable.append(d)
     return comparable, incomparable
@@ -633,6 +647,14 @@ def main():
     binary_name = targets.get("binary", {}).get("name", run_dir.name)
     version = targets.get("binary", {}).get("version", "?")
     build_configuration = targets.get("build_configuration") or ""
+    # sha256 образца из манифеста (его пишет orchestrate). Нужен для сравнимости:
+    # разный бинарь под ОДНОЙ версией -- не "разброс", а другой бинарь.
+    sample_sha256 = ""
+    try:
+        _m = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        sample_sha256 = _m.get("sample_sha256") or ""
+    except Exception:
+        pass
 
     reports = collect_attacker_reports(run_dir)
     if not reports:
@@ -726,6 +748,7 @@ def main():
         "attack_fingerprint": fingerprint,
         "attack_models": attack_models,
         "build_configuration": build_configuration,
+        "sample_sha256": sample_sha256,
         "resilience": resilience,
         "targets": rows,
     }
@@ -735,7 +758,8 @@ def main():
     comparable, incomparable = ([], [])
     if attack_ok:
         comparable, incomparable = find_previous(
-            run_dir, binary_name, fingerprint, judge_model, build_configuration)
+            run_dir, binary_name, fingerprint, judge_model, build_configuration,
+            version, sample_sha256)
     comparable = [d for d in comparable if d.get("resilience") is not None]
     if comparable and resilience is not None:
         prev = comparable[-1]  # самый свежий сопоставимый

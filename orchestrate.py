@@ -149,12 +149,23 @@ def main():
         print(f"[i]   {d['id'][:40]:<40} {route:<13} бюджет ${budget_of(d)} ({kind})")
     print()
 
+    # sha256 образца: идентичность бинаря. Нужна судье для сравнимости -- два прогона
+    # одной версии, но с разным бинарём (напр. мягкий vs хардёный под одной меткой)
+    # сравнивать как "разброс" нельзя. См. judge.find_previous.
+    import hashlib
+    _h = hashlib.sha256()
+    with open(sample, "rb") as _f:
+        for _chunk in iter(lambda: _f.read(1 << 20), b""):
+            _h.update(_chunk)
+    sample_sha256 = _h.hexdigest()
+
     # Манифест пишем сразу, чтобы при обрыве было видно, что запускалось.
     manifest = {
         "run_id": run_id,
         "label": args.label,
         "sample": sample.name,
         "sample_bytes": sample.stat().st_size,
+        "sample_sha256": sample_sha256,
         "models": models,
         "routes": routes,
         "max_turns": args.max_turns,
